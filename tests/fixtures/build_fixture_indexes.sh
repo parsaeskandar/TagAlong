@@ -58,7 +58,13 @@ THREADS="${THREADS:-4}"
 MINIMIZER_ARGS="${MINIMIZER_ARGS:-}"
 
 [[ -s "$GBZ_IN" ]] || { echo "ERROR: input graph not found: $GBZ_IN" >&2; exit 1; }
-mkdir -p "$OUT"
+
+# Absolutize paths so they survive the `cd "$OUT"` below: gbz_extract/grlbwt-cli
+# write <basename>.rl_bwt in the current directory, so we run those from $OUT.
+GBZ_IN="$(realpath "$GBZ_IN")"
+mkdir -p "$OUT"; OUT="$(realpath "$OUT")"
+BIN="$(realpath "$BIN")"
+case "$VG" in */*) VG="$(realpath "$VG")";; esac
 TMP="$OUT/tmp"; mkdir -p "$TMP"
 
 # Tool presence check (fail early with a clear message).
@@ -69,39 +75,41 @@ for t in "$BIN/build_tags" "$BIN/build_rindex" "$BIN/convert_tags" \
 done
 need gbz_extract
 need grlbwt-cli
-if [[ $COORD_ONLY -eq 0 ]]; then need "$VG"; fi
+need "$VG"     # used for fastlocate.ri (vg gbwt) even in --coord-only mode
 
 echo "=== [0/8] stage graph.gbz ==="
-GBZ="$OUT/graph.gbz"
-cp -f "$GBZ_IN" "$GBZ"
+cp -f "$GBZ_IN" "$OUT/graph.gbz"
+
+# Run the remaining steps from inside $OUT so gbz_extract / grlbwt-cli keep
+# their (basename-derived) outputs inside the fixture dir.
+cd "$OUT"
 
 echo "=== [1/8] gbz_extract -> RL-BWT info ==="
-INFO="$OUT/graph_info"
-gbz_extract -t "$THREADS" -b "$GBZ" > "$INFO"
+gbz_extract -t "$THREADS" -b graph.gbz > graph_info
 
-echo "=== [2/8] grlbwt-cli -> ${INFO}.rl_bwt ==="
-grlbwt-cli -t "$THREADS" -T "$TMP" "$INFO"
-RLBWT="${INFO}.rl_bwt"
-[[ -s "$RLBWT" ]] || { echo "ERROR: grlbwt-cli did not produce $RLBWT" >&2; exit 1; }
+echo "=== [2/8] grlbwt-cli -> graph_info.rl_bwt ==="
+grlbwt-cli -t "$THREADS" -T "$TMP" graph_info
+[[ -s graph_info.rl_bwt ]] || { echo "ERROR: grlbwt-cli did not produce $OUT/graph_info.rl_bwt" >&2; exit 1; }
 
 echo "=== [3/8] build_tags ==="
-"$BIN/build_tags" "$GBZ" "$RLBWT" "$OUT/raw.tags"
+"$BIN/build_tags" graph.gbz graph_info.rl_bwt raw.tags
 
 echo "=== [4/8] build_rindex -> rlbwt_rindex.ri ==="
-"$BIN/build_rindex" "$RLBWT" > "$OUT/rlbwt_rindex.ri"
+"$BIN/build_rindex" graph_info.rl_bwt > rlbwt_rindex.ri
 
 echo "=== [5/8] convert_tags + build_sampled_tags -> sampled.tags ==="
-"$BIN/convert_tags" "$OUT/raw.tags" "$OUT/compact.tags"
-"$BIN/build_sampled_tags" "$OUT/compact.tags" "$OUT/sampled.tags"
+"$BIN/convert_tags" raw.tags compact.tags
+"$BIN/build_sampled_tags" compact.tags sampled.tags
 
 echo "=== [6/8] vg gbwt -> fastlocate.ri (GBWT FastLocate) ==="
 # The GBWT FastLocate r-index is built from the GBZ's embedded GBWT.
 # (Flag names are stable across recent vg; adjust if your vg differs.)
-"${VG:-vg}" gbwt -Z "$GBZ" -r "$OUT/fastlocate.ri"
+"$VG" gbwt -Z graph.gbz -r fastlocate.ri
 
 echo "=== [7/8] build_translation_tables -> output.t1 / output.t2 ==="
-"$BIN/build_translation_tables" "$GBZ" "$OUT/sampled.tags" \
-    --table1 "$OUT/output.t1" --table2 "$OUT/output.t2"
+# Signature is positional: <graph.gbz> <out.t1> <out.t2> (builds from the GBZ;
+# it does NOT take the sampled tags — those are consumed at query time).
+"$BIN/build_translation_tables" graph.gbz output.t1 output.t2
 
 if [[ $COORD_ONLY -eq 1 ]]; then
     echo "=== done (coordinate indexes only) ==="
@@ -110,10 +118,10 @@ if [[ $COORD_ONLY -eq 1 ]]; then
 fi
 
 echo "=== [8/8] giraffe indexes: distance / minimizer / zipcodes ==="
-"$VG" index -t "$THREADS" -j "$OUT/index.dist" "$GBZ"
+"$VG" index -t "$THREADS" -j index.dist graph.gbz
 # shellcheck disable=SC2086
-"$VG" minimizer -t "$THREADS" -d "$OUT/index.dist" -z "$OUT/index.zipcodes" \
-    $MINIMIZER_ARGS -o "$OUT/index.min" "$GBZ"
+"$VG" minimizer -t "$THREADS" -d index.dist -z index.zipcodes \
+    $MINIMIZER_ARGS -o index.min graph.gbz
 
 echo "=== done ==="
 ls -la "$OUT"

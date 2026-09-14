@@ -53,6 +53,9 @@ def test_translate_returns_list_of_typed_intervals(coord_index, haplotype_names)
         assert isinstance(rec.start, int)
         assert isinstance(rec.end, int)
         assert rec.start <= rec.end
+        # NOTE: this cannot currently fail -- translate() hardcodes '+' at both
+        # call sites (pangenome_server.cpp). It is kept as a type guard, and
+        # test_inversion.py carries the test that actually exercises '-'.
         assert rec.strand in ("+", "-")
 
 
@@ -138,17 +141,29 @@ def test_translation_round_trips(coord_index, haplotype_names):
     start, end, forward = found
     tolerance = 50  # allow for indels between the two haplotypes
     recovered = False
+    strand_mismatch = None
     for fwd in forward:
         back = coord_index.translate(fwd.haplotype, fwd.start, fwd.end, src)
-        if any(
-            b.haplotype == src
+        hits = [
+            b for b in back
+            if b.haplotype == src
             and abs(b.start - start) <= tolerance
             and abs(b.end - end) <= tolerance
-            for b in back
-        ):
+        ]
+        if hits:
+            # Strand must be symmetric: if A->B is inverted then B->A is too.
+            # Checked only on recovered records, so a fixture with no inverted
+            # homology simply sees '+' both ways and passes.
+            if not any(b.strand == fwd.strand for b in hits):
+                strand_mismatch = (fwd.strand, [b.strand for b in hits])
             recovered = True
             break
     assert recovered, (
         f"round-trip {src} -> {forward[0].haplotype} -> {src} did not recover "
         f"[{start},{end}) within {tolerance}bp"
+    )
+    assert strand_mismatch is None, (
+        f"round-trip strand is not symmetric: forward reported "
+        f"{strand_mismatch[0]!r} but the return leg reported "
+        f"{strand_mismatch[1]!r}"
     )

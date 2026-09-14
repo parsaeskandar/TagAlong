@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -187,11 +188,13 @@ TEST(SurjectAnchorBuilder, MetadataAndPathIds) {
     }
 }
 
-// Source = path x (nodes 1, 2, 4, 5, 7). Target = path y. Expect:
+// Source = path x (nodes 1, 2, 4, 5, 7). Target = path y. Expect (with the
+// default multiple-candidate builder):
 //   - Common nodes between x and y: {1, 2, 4, 7}  (node 5 is on x only).
-//   - y visits node 1 twice (positions 0 and 8); 4 twice (positions 5 and 13).
-//   - First anchor's expected target base = 0 (node 1 first visit).
-//   - Last anchor's expected target base  = 17 (node 7 visit on y).
+//   - y visits node 1 twice (bases 0 and 8) and node 4 twice (bases 5 and 13),
+//     so those two read nodes each yield TWO candidate anchors (one per target
+//     occurrence). Node 2 (base 12) and node 7 (base 17) yield one each.
+//   - node 5 (on x only) yields no anchor.
 TEST(SurjectAnchorBuilder, PathXOntoPathY) {
     auto idx = load_all();
 
@@ -219,14 +222,16 @@ TEST(SurjectAnchorBuilder, PathXOntoPathY) {
     ASSERT_EQ(result.target_path_length, 20u);  // y is 20 bases
     ASSERT_FALSE(result.anchors.empty());
 
-    // Every emitted anchor's read range must be inside [0, 12), monotonically
-    // increasing, and target base offsets must be inside the target.
-    size_t last_read_end = 0;
+    // Anchors are emitted in read order (NON-decreasing read_begin_offset —
+    // multiple candidate anchors for the same repeated read node share a read
+    // range, which is expected). Read ranges stay inside [0, 12) and target
+    // base offsets inside the target.
+    size_t last_read_begin = 0;
     for (const auto& a : result.anchors) {
-        EXPECT_GE(a.read_begin_offset, last_read_end);
+        EXPECT_GE(a.read_begin_offset, last_read_begin);
         EXPECT_LE(a.read_end_offset, 12u);
         EXPECT_LE(a.path_offset_step_end, result.target_path_length);
-        last_read_end = a.read_end_offset;
+        last_read_begin = a.read_begin_offset;
     }
 
     // The off-target source mapping (node 5 on x but not on y) must NOT appear
@@ -237,6 +242,34 @@ TEST(SurjectAnchorBuilder, PathXOntoPathY) {
                      NODE5_MAPPING_INDEX <  a.source_mapping_end)
             << "node-5 mapping (index 3) should not be inside any anchor";
     }
+
+    // Multiple-candidate contract: collect the target base offsets emitted for
+    // each source mapping index. Each anchor covers exactly one source mapping
+    // (singleton), so source_mapping_end == source_mapping_begin + 1.
+    std::map<size_t, std::vector<size_t>> targets_by_mapping;
+    for (const auto& a : result.anchors) {
+        EXPECT_EQ(a.source_mapping_end, a.source_mapping_begin + 1)
+            << "multiple-candidate anchors are singletons over one source mapping";
+        targets_by_mapping[a.source_mapping_begin].push_back(a.path_offset_step_begin);
+    }
+    for (auto& kv : targets_by_mapping) std::sort(kv.second.begin(), kv.second.end());
+
+    // Mapping 0 = node 1: two candidates at target bases {0, 8}.
+    ASSERT_TRUE(targets_by_mapping.count(0));
+    EXPECT_EQ(targets_by_mapping[0], (std::vector<size_t>{0u, 8u}))
+        << "node 1 is visited by y at bases 0 and 8 → two candidate anchors";
+    // Mapping 1 = node 2: one candidate at base 12.
+    ASSERT_TRUE(targets_by_mapping.count(1));
+    EXPECT_EQ(targets_by_mapping[1], (std::vector<size_t>{12u}));
+    // Mapping 2 = node 4: two candidates at target bases {5, 13}.
+    ASSERT_TRUE(targets_by_mapping.count(2));
+    EXPECT_EQ(targets_by_mapping[2], (std::vector<size_t>{5u, 13u}))
+        << "node 4 is visited by y at bases 5 and 13 → two candidate anchors";
+    // Mapping 3 = node 5: off-target, no candidate.
+    EXPECT_FALSE(targets_by_mapping.count(3));
+    // Mapping 4 = node 7: one candidate at base 17.
+    ASSERT_TRUE(targets_by_mapping.count(4));
+    EXPECT_EQ(targets_by_mapping[4], (std::vector<size_t>{17u}));
 }
 
 // Empty source should produce EmptyAlignment status and no anchors.
