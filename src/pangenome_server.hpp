@@ -340,6 +340,11 @@ private:
     /// Haplotype names, cached at load(): deriving them walks every GBWT path.
     std::vector<std::string> haplotype_names_;
     std::unordered_map<size_t, std::pair<std::string, size_t>> path_to_global_;
+    /// GBWT path id -> that subpath's length in bases. Needed to convert a
+    /// reverse-strand translation back into forward coordinates: the RLBWT
+    /// stores each path twice (seq 2i forward, seq 2i+1 reverse complement),
+    /// so an offset r on the reverse sequence is length-1-r on the forward one.
+    std::unordered_map<size_t, size_t> path_length_;
 };
 
 #endif // PANGENOME_SERVER_HPP

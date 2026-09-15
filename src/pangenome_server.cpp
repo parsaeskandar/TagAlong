@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <limits>
 #include <chrono>
+#include <functional>
 #include <sys/mman.h>
 
 #include "pangenome_server.hpp"
@@ -142,6 +143,128 @@ extern std::vector<TranslationResult> trace_coordinates_gbwt(
 // ── Local helpers ──────────────────────────────────────────────────────────
 
 namespace {
+
+/// One traced block together with the strand it was found on.
+struct StrandedTrace {
+    std::vector<TranslationResult> trans;
+    bool reverse = false;
+};
+
+/// What the forward pass saw, for callers that report diagnostics.
+struct WindowTraceDiag {
+    uint64_t max_tags = 0;
+    bool have_common = false;
+    CommonNodes common{};
+};
+
+/// Trace source `[lo, hi]` against one target path, allowing the window to hold
+/// BOTH collinear and inverted blocks.
+///
+/// Discovery is orientation-blind: probe_tag folds both node orientations into a
+/// single candidate window (`seqId(v) / 2` drops the strand bit) and Table 2
+/// stores no strand at all. So a window routinely spans an inversion boundary --
+/// collinear flanks around an inverted core -- and the two need DIFFERENT target
+/// sequences to resolve:
+///
+///     collinear block -> target FORWARD sequence (gbwt seq 2*pid)
+///     inverted block  -> target REVERSE sequence (gbwt seq 2*pid+1)
+///
+/// because a node traversed the other way round is a different gbwt::node_type,
+/// and reversing the target path flips every node, undoing the inversion.
+///
+/// A plain "try forward, else try reverse" retry cannot express that: forward
+/// succeeds on the flanks, so the reverse attempt never runs and the inverted
+/// core is dropped silently, reported as a clean forward translation with a hole.
+///
+/// What makes the fix cheap is that build_offset_mapping_with_gbwt_lf joins
+/// source to target BY tag_code and skips source nodes the target does not visit
+/// in the same orientation. A forward trace across an inverted core therefore
+/// does not desynchronize -- it leaves the core as a clean gap. So: trace forward
+/// over the whole window, then re-trace ONLY the source ranges forward failed to
+/// place, against the reverse sequence.
+///
+/// Cost: when forward covers the window -- the overwhelmingly common case --
+/// there are no gaps and this is exactly one attempt, as before. When forward
+/// covers nothing, the single gap is the whole window and this degenerates to
+/// the old retry. The extra work lands only on ranges that already failed.
+std::vector<StrandedTrace> trace_window_both_strands(
+        FastLocate& rindex, SampledTagArray& sampled,
+        const gbwt::GBWT& gbwt_index, const gbwt::FastLocate& gbwt_flocate,
+        const gbwtgraph::GBWTGraph& graph,
+        size_t src_seq_id, size_t lo, size_t hi, size_t tgt_path_id,
+        const std::function<bool()>& expired,
+        WindowTraceDiag* diag) {
+    std::vector<StrandedTrace> out;
+    if (hi < lo) return out;
+
+    auto attempt = [&](size_t a, size_t b, bool rev) -> std::vector<TranslationResult> {
+        if (b < a) return {};
+        const size_t tgt_seq_id = 2 * tgt_path_id + (rev ? 1 : 0);
+
+        std::vector<TagInfo> tags = find_tags_in_interval(
+            rindex, sampled, src_seq_id, a, b,
+            &gbwt_index, &gbwt_flocate, &graph, tgt_seq_id, nullptr);
+        if (diag && !rev)
+            diag->max_tags = std::max<uint64_t>(diag->max_tags, tags.size());
+        if (tags.empty()) return {};
+
+        CommonNodes common = find_first_and_last_common_nodes_gbwt(
+            gbwt_flocate, rindex, sampled, tags, src_seq_id, tgt_seq_id);
+        if (!common.found) return {};
+        if (diag && !diag->have_common) {
+            diag->have_common = true;
+            diag->common = common;
+        }
+
+        return trace_coordinates_gbwt(
+            gbwt_index, gbwt_flocate, graph,
+            src_seq_id, a, b, tgt_seq_id,
+            common.first_source_offset, common.first_target_offset,
+            common.first_source_base,   common.first_target_base,
+            common.first_tag_code,
+            common.last_source_base,    common.last_target_base,
+            common.last_tag_code);
+    };
+
+    // Round 1: the target's forward sequence, over the whole window.
+    std::vector<size_t> covered;
+    {
+        std::vector<TranslationResult> fwd = attempt(lo, hi, false);
+        covered.reserve(fwd.size());
+        for (const TranslationResult& tr : fwd)
+            if (tr.target_offset != 0) covered.push_back(tr.source_offset);
+        if (!fwd.empty()) out.push_back(StrandedTrace{std::move(fwd), false});
+    }
+
+    // Round 2: whatever forward could not place. A gap is only worth a second
+    // trace if it is long enough to be a rearrangement -- short holes are
+    // ordinary indels and unsampled stretches, and probing each one would cost
+    // a full trace for nothing.
+    static const size_t min_gap_bp = []() -> size_t {
+        const char* e = std::getenv("PANGENOME_MIN_INVERSION_BP");
+        if (e) { long v = std::atol(e); if (v > 0) return static_cast<size_t>(v); }
+        return 16;
+    }();
+
+    std::sort(covered.begin(), covered.end());
+    covered.erase(std::unique(covered.begin(), covered.end()), covered.end());
+
+    std::vector<std::pair<size_t, size_t>> gaps;
+    size_t cursor = lo;
+    for (size_t c : covered) {
+        if (c < cursor) continue;
+        if (c > cursor && c - cursor >= min_gap_bp) gaps.emplace_back(cursor, c - 1);
+        cursor = c + 1;
+    }
+    if (cursor <= hi && hi - cursor + 1 >= min_gap_bp) gaps.emplace_back(cursor, hi);
+
+    for (const auto& g : gaps) {
+        if (expired()) break;
+        std::vector<TranslationResult> rev = attempt(g.first, g.second, true);
+        if (!rev.empty()) out.push_back(StrandedTrace{std::move(rev), true});
+    }
+    return out;
+}
 
 std::unordered_map<size_t, std::pair<std::string, size_t>>
 build_path_id_to_global(const TranslationTable1& t1) {
@@ -312,6 +435,12 @@ void Index::load(const std::string& gbz_path,
     }
 
     path_to_global_ = build_path_id_to_global(table1_);
+    path_length_.clear();
+    for (const std::string& n : table1_.names()) {
+        for (const SubpathInfo& sp : table1_.subpaths(n)) {
+            path_length_[sp.path_id] = sp.length;
+        }
+    }
 
     // Cache the haplotype name list. Deriving it walks every GBWT path, which
     // is hundreds of millions of entries on a fragmented graph — far too slow
@@ -571,6 +700,10 @@ Index::translate_no_table2(const std::string& src_haplotype,
         size_t source_haplotype_offset = 0;
         size_t target_haplotype_offset = 0;
         size_t target_path_id = 0;
+        /// True when the correspondence was found on the target's REVERSE
+        /// sequence, i.e. the two haplotypes traverse this region in opposite
+        /// directions. Reported as strand '-'.
+        bool   target_reverse = false;
     };
     std::vector<HaplotypeTranslation> all_raw;
 
@@ -738,7 +871,6 @@ Index::translate_no_table2(const std::string& src_haplotype,
         for (const auto& cand_entry : candidates) {
             if (expired()) break;                   // between candidate targets
             const size_t tgt_path_id = cand_entry.first;
-            const size_t tgt_seq_id = 2 * tgt_path_id;
 
             // Trace only the window this target fragment was actually seen in,
             // padded by the probe resolution. Running every candidate over the
@@ -749,44 +881,65 @@ Index::translate_no_table2(const std::string& src_haplotype,
             const size_t win_hi = std::min(seq_end_incl, cand_entry.second.second + probe_pad);
             if (win_hi < win_lo) continue;
 
-            std::vector<TagInfo> tags = find_tags_in_interval(
-                rindex, sampled, src_seq_id, win_lo, win_hi,
-                gbwt_index_ptr, gbwt_rindex_.get(), &graph, tgt_seq_id, nullptr);
-            if (diag) fd.scoped_tags = std::max<uint64_t>(fd.scoped_tags, tags.size());
-            if (tags.empty()) continue;
-
-            CommonNodes common = find_first_and_last_common_nodes_gbwt(
-                *gbwt_rindex_, rindex, sampled, tags, src_seq_id, tgt_seq_id);
-            if (!common.found) continue;
-            if (diag) {
-                fd.first_source_base = common.first_source_base;
-                fd.first_target_base = common.first_target_base;
-                fd.last_source_base  = common.last_source_base;
-                fd.last_target_base  = common.last_target_base;
-                fd.first_unique = common.first_is_unique;
-                fd.last_unique  = common.last_is_unique;
-            }
-
-            std::vector<TranslationResult> trans = trace_coordinates_gbwt(
-                *gbwt_index_ptr, *gbwt_rindex_, graph,
-                src_seq_id, win_lo, win_hi, tgt_seq_id,
-                common.first_source_offset, common.first_target_offset,
-                common.first_source_base, common.first_target_base,
-                common.first_tag_code,
-                common.last_source_base, common.last_target_base,
-                common.last_tag_code);
-
             auto it_tgt = path_to_global_.find(tgt_path_id);
             if (it_tgt == path_to_global_.end()) continue;
             const size_t tgt_subpath_start = it_tgt->second.second;
 
-            for (const TranslationResult& tr : trans) {
-                if (tr.target_offset == 0) continue;
-                HaplotypeTranslation ht;
-                ht.source_haplotype_offset = src_subpath_start + tr.source_offset;
-                ht.target_haplotype_offset = tgt_subpath_start + tr.target_offset;
-                ht.target_path_id = tgt_path_id;
-                all_raw.push_back(ht);
+            // Resolve this window on BOTH strands: collinear blocks against
+            // the target's forward sequence, inverted ones against its reverse.
+            // The probe that produced win_lo/win_hi is orientation-blind, so a
+            // window can legitimately contain both.
+            WindowTraceDiag wdiag;
+            std::vector<StrandedTrace> traces = trace_window_both_strands(
+                rindex, sampled, *gbwt_index_ptr, *gbwt_rindex_, graph,
+                src_seq_id, win_lo, win_hi, tgt_path_id, expired,
+                diag ? &wdiag : nullptr);
+            if (diag) {
+                fd.scoped_tags = std::max<uint64_t>(fd.scoped_tags, wdiag.max_tags);
+                if (wdiag.have_common) {
+                    fd.first_source_base = wdiag.common.first_source_base;
+                    fd.first_target_base = wdiag.common.first_target_base;
+                    fd.last_source_base  = wdiag.common.last_source_base;
+                    fd.last_target_base  = wdiag.common.last_target_base;
+                    fd.first_unique = wdiag.common.first_is_unique;
+                    fd.last_unique  = wdiag.common.last_is_unique;
+                }
+            }
+            if (traces.empty()) continue;
+
+            // Offsets from a reverse sequence are reverse-complement coordinates;
+            // map them back so everything reported is in the target's own forward
+            // frame, with the flip recorded as strand '-'.
+            size_t tgt_len = 0;
+            bool have_len = false;
+            {
+                auto it_len = path_length_.find(tgt_path_id);
+                if (it_len != path_length_.end() && it_len->second > 0) {
+                    tgt_len = it_len->second;
+                    have_len = true;
+                }
+            }
+
+            for (const StrandedTrace& st : traces) {
+                if (st.reverse && !have_len) continue;   // cannot convert the frame
+                for (const TranslationResult& tr : st.trans) {
+                    // target_offset 0 is the tracer's "unmapped" sentinel, not a
+                    // position. On a reverse sequence that also discards a real
+                    // offset 0 (the path's last base forward); a pre-existing
+                    // wart, kept so both strands behave identically.
+                    if (tr.target_offset == 0) continue;
+                    size_t tgt_local = tr.target_offset;
+                    if (st.reverse) {
+                        if (tgt_local >= tgt_len) continue;
+                        tgt_local = tgt_len - 1 - tgt_local;
+                    }
+                    HaplotypeTranslation ht;
+                    ht.source_haplotype_offset = src_subpath_start + tr.source_offset;
+                    ht.target_haplotype_offset = tgt_subpath_start + tgt_local;
+                    ht.target_path_id = tgt_path_id;
+                    ht.target_reverse = st.reverse;
+                    all_raw.push_back(ht);
+                }
             }
         }
         if (diag) {
@@ -813,7 +966,7 @@ Index::translate_no_table2(const std::string& src_haplotype,
                                                           : tgt_haplotype;
         ti.start = static_cast<int64_t>(ht.source_haplotype_offset);
         ti.end   = static_cast<int64_t>(ht.target_haplotype_offset);
-        ti.strand = '+';
+        ti.strand = ht.target_reverse ? '-' : '+';
         results.push_back(ti);
     }
     return results;
@@ -955,6 +1108,10 @@ Index::translate(const std::string& src_haplotype,
         size_t source_haplotype_offset = 0;
         size_t target_haplotype_offset = 0;
         size_t target_path_id = 0;
+        /// True when the correspondence was found on the target's REVERSE
+        /// sequence, i.e. the two haplotypes traverse this region in opposite
+        /// directions. Reported as strand '-'.
+        bool   target_reverse = false;
     };
     std::vector<HaplotypeTranslation> all_raw;
 
@@ -1011,41 +1168,54 @@ Index::translate(const std::string& src_haplotype,
 
             size_t extent_start_incl = extent_start;
             size_t extent_end_incl   = extent_end - 1;
-            size_t tgt_seq_id = 2 * tgt_path_id;
-
-            std::vector<TagInfo> tags = find_tags_in_interval(
-                rindex, sampled, src_seq_id,
-                extent_start_incl, extent_end_incl,
-                gbwt_index_ptr, gbwt_rindex_.get(), &graph,
-                tgt_seq_id, nullptr);
-            if (tags.empty()) continue;
-
-            CommonNodes common = find_first_and_last_common_nodes_gbwt(
-                *gbwt_rindex_, rindex, sampled, tags,
-                src_seq_id, tgt_seq_id);
-            if (!common.found) continue;
-
-            std::vector<TranslationResult> trans = trace_coordinates_gbwt(
-                *gbwt_index_ptr, *gbwt_rindex_, graph,
-                src_seq_id, extent_start_incl, extent_end_incl,
-                tgt_seq_id,
-                common.first_source_offset, common.first_target_offset,
-                common.first_source_base,   common.first_target_base,
-                common.first_tag_code,
-                common.last_source_base,    common.last_target_base,
-                common.last_tag_code);
 
             auto it_tgt = path_to_global_.find(tgt_path_id);
             if (it_tgt == path_to_global_.end()) continue;
             size_t tgt_subpath_start = it_tgt->second.second;
 
-            for (const TranslationResult& tr : trans) {
-                if (tr.target_offset == 0) continue;
-                HaplotypeTranslation ht;
-                ht.source_haplotype_offset = src_subpath_start + tr.source_offset;
-                ht.target_haplotype_offset = tgt_subpath_start + tr.target_offset;
-                ht.target_path_id = tgt_path_id;
-                all_raw.push_back(ht);
+            // Resolve this extent on BOTH strands. Table 2 stores no strand
+            // at all -- it only says "this source range has a translation on
+            // path Y" -- so an extent can hold collinear and inverted blocks
+            // alike, and each needs a different target sequence to resolve.
+            std::vector<StrandedTrace> traces = trace_window_both_strands(
+                rindex, sampled, *gbwt_index_ptr, *gbwt_rindex_, graph,
+                src_seq_id, extent_start_incl, extent_end_incl, tgt_path_id,
+                past_deadline, nullptr);
+            if (traces.empty()) continue;
+
+            // Offsets from a reverse sequence are reverse-complement coordinates;
+            // map them back so everything reported is in the target's own forward
+            // frame, with the flip recorded as strand '-'.
+            size_t tgt_len = 0;
+            bool have_len = false;
+            {
+                auto it_len = path_length_.find(tgt_path_id);
+                if (it_len != path_length_.end() && it_len->second > 0) {
+                    tgt_len = it_len->second;
+                    have_len = true;
+                }
+            }
+
+            for (const StrandedTrace& st : traces) {
+                if (st.reverse && !have_len) continue;   // cannot convert the frame
+                for (const TranslationResult& tr : st.trans) {
+                    // target_offset 0 is the tracer's "unmapped" sentinel, not a
+                    // position. On a reverse sequence that also discards a real
+                    // offset 0 (the path's last base forward); a pre-existing
+                    // wart, kept so both strands behave identically.
+                    if (tr.target_offset == 0) continue;
+                    size_t tgt_local = tr.target_offset;
+                    if (st.reverse) {
+                        if (tgt_local >= tgt_len) continue;
+                        tgt_local = tgt_len - 1 - tgt_local;
+                    }
+                    HaplotypeTranslation ht;
+                    ht.source_haplotype_offset = src_subpath_start + tr.source_offset;
+                    ht.target_haplotype_offset = tgt_subpath_start + tgt_local;
+                    ht.target_path_id = tgt_path_id;
+                    ht.target_reverse = st.reverse;
+                    all_raw.push_back(ht);
+                }
             }
         }
     }
@@ -1071,7 +1241,11 @@ Index::translate(const std::string& src_haplotype,
                        : tgt_haplotype;
         ti.start     = static_cast<int64_t>(ht.source_haplotype_offset);
         ti.end       = static_cast<int64_t>(ht.target_haplotype_offset);
-        ti.strand    = '+';
+        // '-' when the correspondence was found on the target's reverse
+        // sequence: the two haplotypes cross this region in opposite
+        // directions. Previously hardcoded '+', so inversions were reported
+        // as forward.
+        ti.strand    = ht.target_reverse ? '-' : '+';
         results.push_back(ti);
     }
     if (timed_out) *timed_out = hit_deadline;

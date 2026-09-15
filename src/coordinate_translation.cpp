@@ -1559,7 +1559,16 @@ bool check_common_node(
     }
     
     if (source_base_offsets.empty() || target_base_offsets.empty()) {
-        cerr << "  No common nodes found in RLBWT But in GBWT we found both source and target visits" << endl;
+        // Say WHICH side is missing and how many visits the RLBWT returned at
+        // all: "the RLBWT knows nothing about this tag" and "the RLBWT knows the
+        // tag but not this sequence" are different bugs, and the old message
+        // could not tell them apart.
+        cerr << "  No common node in RLBWT for tag_code=" << tag_info.tag_code
+             << " (node " << node_id << (is_rev ? "-" : "+") << "): "
+             << source_visits_rlbwt.size() << " rlbwt visits, src_seq="
+             << source_seq_id << " matched " << source_base_offsets.size()
+             << ", tgt_seq=" << target_seq_id << " matched "
+             << target_base_offsets.size() << " (GBWT found both)" << endl;
         return false;  // Not common to both
     }
     

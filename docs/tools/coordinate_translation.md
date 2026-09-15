@@ -35,15 +35,22 @@ You need all required artifacts in place. Build/order is:
   - Table 1 file (`output.t1`)
   - Table 2 file (`output.t2`)
   - **How to create:**  
-    Use the appropriate translation table generation script or binary, providing the relevant graph/index/tag artifacts as input. The typical command is:
+    Both tables are built together by one positional command:
     ```bash
     ./bin/build_translation_tables \
       <graph.gbz> \
-      <sampled.tags> \
-      --table1 <output.t1> \
-      --table2 <output.t2>
+      <fastlocate.ri> \
+      <output.t1> \
+      <output.t2> \
+      [--threads N] [--only-table1]
     ```
-    This command will generate both Table 1 and Table 2 from your graph and sampled tags. Ensure these are built from the *same* graph and tag set you use for downstream coordinate translation. For whole-genome workflows or merged tag scenarios, see the [Whole-Genome Pipeline](../pipelines/whole-genome-pipeline.md) for more details.
+    The GBWT FastLocate r-index is required: Table 2 records which target paths a
+    source range can reach, and resolves them with `decompressSA`. The sampled
+    tags are NOT an input here — they are consumed at query time, not at build
+    time. Build every artifact from the *same* graph. Prefer the non-filtered
+    graph: Table 2 scales with GBWT path count, and frequency filtering multiplies
+    that by ~2,400 without adding information. For whole-genome workflows see the
+    [Whole-Genome Pipeline](../pipelines/whole-genome-pipeline.md).
 
 ---
 

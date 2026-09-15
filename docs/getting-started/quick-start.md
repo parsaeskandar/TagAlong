@@ -20,7 +20,7 @@ grlbwt-cli -t 8 graph_info
 ## 3) Convert tags (required by query/find_mems)
 
 ```bash
-./bin/convert_tags output.tags output_compressed.tags
+./bin/convert_tags output.tags output_compressed.tags --gbz graph.gbz
 ```
 
 ## 4) Run downstream tools

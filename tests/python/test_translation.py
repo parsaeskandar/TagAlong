@@ -23,6 +23,22 @@ def _tuples(records):
     return [(r.haplotype, r.start, r.end, r.strand) for r in records]
 
 
+# IMPORTANT, and the source of three separate test bugs so far: despite the name,
+# a ``TranslatedInterval`` from translate() is NOT an interval. It is a per-base
+# correspondence -- ``start`` is an offset on the SOURCE haplotype and ``end`` is
+# the offset it maps to on the TARGET. One record per base, not one per region.
+#
+# So ``(r.start, r.end)`` is a (source, target) PAIR. Feeding it back into
+# translate() as if it were [start, end) mixes two coordinate systems and cannot
+# work; comparing ``r.end`` against a source interval's end is likewise
+# meaningless. Both mistakes are easy to miss because on a collinear region the
+# numbers look plausible.
+def _pairs(records, haplotype=None):
+    """{source_offset: target_offset} for records, optionally on one haplotype."""
+    return {r.start: r.end for r in records
+            if haplotype is None or r.haplotype == haplotype}
+
+
 # --------------------------------------------------------------------------- #
 # Contract: error / validation paths
 # --------------------------------------------------------------------------- #
@@ -112,14 +128,33 @@ def test_identity_translation_preserves_interval(coord_index, haplotype_names):
     src = haplotype_names[0]
     found = _first_translatable(coord_index, src, src)
     if not found:
-        pytest.skip(f"no self-translatable interval on {src!r} (degenerate fixture?)")
+        # Not a degenerate fixture -- Table 2 deliberately stores no route from a
+        # haplotype to itself (build_translation_tables.cpp: `if (!allow_same_hap
+        # && h == path_hap[sp]) return;`, and --allow-same-haplotype defaults
+        # off). So the T2 serving path cannot answer an identity query at all.
+        # The table-free path can, since it discovers candidates by probing.
+        pytest.skip(
+            f"no self-translatable interval on {src!r}: Table 2 excludes "
+            "same-haplotype pairs by design (build with --allow-same-haplotype, "
+            "or run this under PANGENOME_TRANSLATE_NO_T2=1)"
+        )
     start, end, res = found
     same = [r for r in res if r.haplotype == src]
     assert same, f"identity produced no record on {src!r}: {_tuples(res)}"
-    assert any(r.start == start and r.end == end and r.strand == "+" for r in same), (
-        f"identity did not preserve [{start},{end}) on {src!r}: "
-        f"{[(r.start, r.end, r.strand) for r in same]}"
+
+    # Records are (source, target) pairs, so an identity lift means every base
+    # maps to itself: src == tgt, forward strand.
+    pairs = _pairs(same)
+    wrong = {a: b for a, b in pairs.items() if a != b}
+    assert not wrong, (
+        f"identity did not map bases to themselves on {src!r}: "
+        f"{sorted(wrong.items())[:10]}"
     )
+    assert all(r.strand == "+" for r in same), (
+        f"identity reported a reverse strand on {src!r}: "
+        f"{[(r.start, r.end, r.strand) for r in same if r.strand != '+'][:10]}"
+    )
+    assert pairs, f"identity produced no usable pairs on {src!r}"
 
 
 @pytest.mark.oracle
@@ -139,16 +174,23 @@ def test_translation_round_trips(coord_index, haplotype_names):
         pytest.skip(f"no cross-haplotype homology found from {src!r}")
 
     start, end, forward = found
+    span = end - start
     tolerance = 50  # allow for indels between the two haplotypes
     recovered = False
     strand_mismatch = None
+    # Each `fwd` is a (source_offset -> target_offset) pair. To go back, ask for
+    # an interval on the TARGET that begins at the target offset, then look for a
+    # returned pair whose own target offset lands back on the source offset we
+    # started from. Passing (fwd.start, fwd.end) as an interval -- as this test
+    # used to -- spans two different haplotypes' coordinate systems.
     for fwd in forward:
-        back = coord_index.translate(fwd.haplotype, fwd.start, fwd.end, src)
+        src_off, tgt_off = fwd.start, fwd.end
+        back = coord_index.translate(fwd.haplotype, tgt_off, tgt_off + span, src)
         hits = [
             b for b in back
             if b.haplotype == src
-            and abs(b.start - start) <= tolerance
-            and abs(b.end - end) <= tolerance
+            and abs(b.start - tgt_off) <= tolerance
+            and abs(b.end - src_off) <= tolerance
         ]
         if hits:
             # Strand must be symmetric: if A->B is inverted then B->A is too.
@@ -159,8 +201,10 @@ def test_translation_round_trips(coord_index, haplotype_names):
             recovered = True
             break
     assert recovered, (
-        f"round-trip {src} -> {forward[0].haplotype} -> {src} did not recover "
-        f"[{start},{end}) within {tolerance}bp"
+        f"round-trip {src} -> {forward[0].haplotype} -> {src} did not recover any "
+        f"of the {len(forward)} base correspondences from [{start},{end}) within "
+        f"{tolerance}bp; first pair was source {forward[0].start} -> target "
+        f"{forward[0].end}"
     )
     assert strand_mismatch is None, (
         f"round-trip strand is not symmetric: forward reported "

@@ -5,13 +5,24 @@
 #include <stdexcept>
 
 #include "pangenome_index/tag_arrays.hpp"
+#include <gbwtgraph/gbz.h>
 
 using namespace std;
 using namespace panindexer;
 using handlegraph::pos_t;
 
 static void usage(const char* prog) {
-    cerr << "Usage: " << prog << " <input_algorithm_file> <output_compressed_file> [--num-seq N]\n";
+    cerr << "Usage: " << prog << " <input_algorithm_file> <output_compressed_file>"
+         << " (--gbz <graph.gbz> | --num-seq N)\n"
+         << "\n"
+         << "  --gbz <graph.gbz>  derive the sequence count from the GBZ (preferred)\n"
+         << "  --num-seq N        number of BWT sequences, i.e. endmarkers; for a\n"
+         << "                     bidirectional GBWT this is 2 x the number of paths\n"
+         << "\n"
+         << "One of the two is REQUIRED. The BWT reserves one position per sequence\n"
+         << "for its endmarker, and this tool prepends them. Omitting the count builds\n"
+         << "a tag array (N-1) positions short of the r-index, which silently shifts\n"
+         << "every tag and makes coordinate translation lose almost all of its bases.\n";
 }
 
 int main(int argc, char** argv) {
@@ -28,16 +39,31 @@ int main(int argc, char** argv) {
     string bwt_intervals_tmp = output_file + ".bwt_intervals.tmp";
 
     // Flags parsing (after 2 required positional args)
-    size_t bwt_offset = 0; // Optional initial BWT offset (e.g., number of sequences)
+    // Number of BWT sequences (= endmarkers) to prepend. There is no sane
+    // default: 0 produces a tag array that is (sequences - 1) positions shorter
+    // than the r-index it will be queried against, so every lookup past the
+    // first endmarker reads a position belonging to some other sequence. That
+    // failed silently -- as "gap" tags and dropped bases -- rather than loudly,
+    // so the count is now required.
+    size_t bwt_offset = 0;
+    bool have_offset = false;
+    string gbz_file_path;
     for (int i = 3; i < argc; ++i) {
         string arg = argv[i];
-        if (arg == "--num-seq" || arg == "-n") {
+        if (arg == "--gbz") {
+            if (i + 1 >= argc) {
+                cerr << "Error: missing value for " << arg << "\n";
+                return 1;
+            }
+            gbz_file_path = argv[++i];
+        } else if (arg == "--num-seq" || arg == "-n") {
             if (i + 1 >= argc) {
                 cerr << "Error: missing value for " << arg << "\n";
                 return 1;
             }
             try {
                 bwt_offset = static_cast<size_t>(stoull(argv[++i]));
+                have_offset = true;
             } catch (const std::exception&) {
                 cerr << "Error: invalid value for --num-seq (expected unsigned integer)\n";
                 return 1;
@@ -47,6 +73,41 @@ int main(int argc, char** argv) {
             usage(argv[0]);
             return 1;
         }
+    }
+
+    if (!gbz_file_path.empty()) {
+        gbwtgraph::GBZ gbz;
+        std::ifstream gbz_in(gbz_file_path, std::ios::binary);
+        if (!gbz_in) {
+            cerr << "Error: cannot open GBZ file: " << gbz_file_path << "\n";
+            return 1;
+        }
+        try {
+            gbz.simple_sds_load(gbz_in);
+        } catch (const std::exception& e) {
+            cerr << "Error: failed to load GBZ: " << e.what() << "\n";
+            return 1;
+        }
+        const size_t from_gbz = gbz.index.sequences();
+        if (have_offset && bwt_offset != from_gbz) {
+            cerr << "Error: --num-seq " << bwt_offset << " disagrees with the GBZ, "
+                 << "which has " << from_gbz << " sequences\n";
+            return 1;
+        }
+        bwt_offset = from_gbz;
+        have_offset = true;
+        cerr << "Sequence count from GBZ: " << bwt_offset
+             << " (endmarker positions to prepend)\n";
+    }
+
+    if (!have_offset) {
+        cerr << "Error: the sequence count is required -- pass --gbz <graph.gbz> "
+                "or --num-seq N.\n"
+                "Without it the tag array is built (sequences - 1) positions "
+                "shorter than the r-index,\nwhich shifts every tag and makes "
+                "coordinate translation lose nearly all of its bases.\n";
+        usage(argv[0]);
+        return 1;
     }
 
     // Read the entire input file (algorithm.hpp format: raw gbwt::ByteCode runs) into memory

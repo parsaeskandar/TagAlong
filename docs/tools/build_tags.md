@@ -19,6 +19,6 @@ Constructs tag arrays from a GBZ graph and RL-BWT.
 If using query/find_mems, convert tags:
 
 ```bash
-./bin/convert_tags output.tags output_compressed.tags
+./bin/convert_tags output.tags output_compressed.tags --gbz graph.gbz
 ```
 

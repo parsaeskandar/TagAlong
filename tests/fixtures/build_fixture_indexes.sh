@@ -28,6 +28,7 @@
 #   fastlocate.ri      GBWT FastLocate r-index   (coordinate translation)
 #   output.t1          translation table 1
 #   output.t2          translation table 2
+#   tags_check.log     tag-array verification output (build aborts if it fails)
 #
 # The coordinate chain (ri/tags/fastlocate/t1/t2) is enough for the translation
 # tests. The giraffe chain (dist/min/zipcodes) is additionally needed for the
@@ -98,8 +99,40 @@ echo "=== [4/8] build_rindex -> rlbwt_rindex.ri ==="
 "$BIN/build_rindex" graph_info.rl_bwt > rlbwt_rindex.ri
 
 echo "=== [5/8] convert_tags + build_sampled_tags -> sampled.tags ==="
-"$BIN/convert_tags" raw.tags compact.tags
+# --gbz is REQUIRED here, not optional: convert_tags prepends one BWT position
+# per sequence for its endmarker. Omitting it built a tag array (sequences - 1)
+# positions shorter than rlbwt_rindex.ri, which shifted every tag and made
+# coordinate translation return almost nothing. `tags_check --verify-sampled`
+# catches it.
+"$BIN/convert_tags" raw.tags compact.tags --gbz graph.gbz
 "$BIN/build_sampled_tags" compact.tags sampled.tags
+
+echo "=== [5b/8] tags_check --verify-sampled (fail fast on a misaligned array) ==="
+# The sampled tag array indexes into the r-index's BWT positions on trust: they
+# are built by two independent branches off graph_info.rl_bwt and nothing else
+# checks that they agree. When they did not (convert_tags was called without the
+# sequence count, so endmarkers were never prepended), every tag was shifted and
+# coordinate translation silently returned almost nothing -- which cost far more
+# to diagnose from query results than this one check costs to run.
+if [[ -x "$BIN/tags_check" ]]; then
+    if ! "$BIN/tags_check" --verify-sampled rlbwt_rindex.ri sampled.tags \
+            --gbz graph.gbz > tags_check.log 2>&1; then
+        echo "ERROR: tags_check --verify-sampled failed; see $OUT/tags_check.log" >&2
+        tail -20 tags_check.log >&2
+        exit 1
+    fi
+    # It reports mismatches on stdout and still exits 0, so grep the log too.
+    if grep -qE "^WARNING: RLBWT BWT size|MISMATCH" tags_check.log; then
+        echo "ERROR: the sampled tag array does not agree with the r-index." >&2
+        echo "       A size warning means the endmarker count is wrong; MISMATCH" >&2
+        echo "       lines mean tags are misaligned. See $OUT/tags_check.log" >&2
+        grep -E "^WARNING: RLBWT BWT size|MISMATCH" tags_check.log | head -5 >&2
+        exit 1
+    fi
+    echo "tag array verified against the r-index"
+else
+    echo "WARNING: $BIN/tags_check not built; skipping tag-array verification" >&2
+fi
 
 echo "=== [6/8] vg gbwt -> fastlocate.ri (GBWT FastLocate) ==="
 # The GBWT FastLocate r-index is built from the GBZ's embedded GBWT.
@@ -107,9 +140,11 @@ echo "=== [6/8] vg gbwt -> fastlocate.ri (GBWT FastLocate) ==="
 "$VG" gbwt -Z graph.gbz -r fastlocate.ri
 
 echo "=== [7/8] build_translation_tables -> output.t1 / output.t2 ==="
-# Signature is positional: <graph.gbz> <out.t1> <out.t2> (builds from the GBZ;
-# it does NOT take the sampled tags — those are consumed at query time).
-"$BIN/build_translation_tables" graph.gbz output.t1 output.t2
+# Signature is positional: <graph.gbz> <fastlocate.ri> <out.t1> <out.t2>.
+# The r-index (built in step 6 above) is required: Table 2 resolves which target
+# paths a source range reaches via decompressSA. It does NOT take the sampled
+# tags — those are consumed at query time.
+"$BIN/build_translation_tables" graph.gbz fastlocate.ri output.t1 output.t2
 
 if [[ $COORD_ONLY -eq 1 ]]; then
     echo "=== done (coordinate indexes only) ==="
