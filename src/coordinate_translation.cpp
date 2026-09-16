@@ -486,13 +486,21 @@ static size_t recover_text_pos_from_bwt(FastLocate& r_index, size_t bwt_pos) {
 // Optional fast path: when gbwt_index, gbwt_fast_locate, graph, and target_seq_id are provided
 // and the GBWT is bidirectional, stops at the last common node with the target haplotype and
 // completes the interval using GBWT inverseLF (backward walk) instead of r-index LF.
+// `allow_extended_search` controls the last-ditch fallback below: when no common
+// node is found INSIDE the interval, the fast path walks the BWT backward past
+// the interval start looking for one. That is worth doing for a primary query,
+// where an anchor outside the interval still yields a mapping. It is NOT worth
+// doing for a speculative probe -- a caller asking "is there anything here on
+// the other strand?" gets no useful answer from an anchor a chromosome away, and
+// pays a full backward walk to learn nothing. Such callers pass false.
 vector<TagInfo> find_tags_in_interval(FastLocate& r_index, SampledTagArray& sampled,
                                        size_t source_seq_id, size_t seq_start, size_t seq_end,
                                        const gbwt::GBWT* gbwt_index = nullptr,
                                        const gbwt::FastLocate* gbwt_fast_locate = nullptr,
                                        const gbwtgraph::GBWTGraph* graph = nullptr,
                                        size_t target_seq_id = numeric_limits<size_t>::max(),
-                                       FindTagsInIntervalTiming* out_timing = nullptr) {
+                                       FindTagsInIntervalTiming* out_timing = nullptr,
+                                       bool allow_extended_search = true) {
     auto t_find_tags_start = high_resolution_clock::now();
     vector<TagInfo> tags;
     unordered_map<uint64_t, TagInfo> tag_map;
@@ -778,11 +786,42 @@ vector<TagInfo> find_tags_in_interval(FastLocate& r_index, SampledTagArray& samp
     // Fast path: if no common node was found inside the interval (e.g. interval is too small
     // to cover any sampled tag run), extend the BWT walk backward past text_pos_i down to the
     // haplotype start, looking for the first source tag whose node is also visited by the target.
-    if (use_fast_path && !found_last_common) {
+    //
+    // This walk costs one LF step, one sampled-tag lookup and (on every tag hit)
+    // one decompressSA PER BASE, and it runs until it finds an anchor. Left
+    // unbounded its cost is therefore proportional to the interval's ABSOLUTE
+    // coordinate, not to the interval's size: a query that finds nothing at
+    // offset 16 Mb walks 16 million bases before giving up. Two bounds apply.
+    //
+    // (1) Speculative callers opt out entirely (see allow_extended_search).
+    // (2) Everyone else gets a distance cap. An anchor found megabases away is
+    //     of little use anyway -- it bounds the target walk so loosely that the
+    //     trace does almost nothing with it -- so the cap costs essentially no
+    //     real mappings while making the worst case bounded. Override with
+    //     PANGENOME_EXTEND_CAP_BP; 0 restores the old unbounded behavior.
+    static const size_t extend_cap_bp = []() -> size_t {
+        const char* e = std::getenv("PANGENOME_EXTEND_CAP_BP");
+        if (e) return static_cast<size_t>(std::max(0L, std::atol(e)));
+        return 1000000;   // 1 Mb
+    }();
+
+    if (use_fast_path && !found_last_common && !allow_extended_search) {
+        if (debug) {
+            cerr << "  [extend] No common node in interval; extended search disabled by caller" << endl;
+        }
+    } else if (use_fast_path && !found_last_common) {
         size_t text_pos_haplotype_start = r_index.pack(source_seq_id, 0);
+        // Stop at whichever comes first: the haplotype start or the cap.
+        if (extend_cap_bp > 0) {
+            const size_t already = (current_text_pos > text_pos_haplotype_start)
+                                 ? (current_text_pos - text_pos_haplotype_start) : 0;
+            if (already > extend_cap_bp)
+                text_pos_haplotype_start = current_text_pos - extend_cap_bp;
+        }
         if (debug) {
             cerr << "  [extend] No common node in interval; extending backward past interval start "
-                 << "(text_pos_i=" << text_pos_i << ", haplotype_start=" << text_pos_haplotype_start << ")" << endl;
+                 << "(text_pos_i=" << text_pos_i << ", stop_at=" << text_pos_haplotype_start
+                 << ", cap_bp=" << extend_cap_bp << ")" << endl;
         }
         while (current_text_pos > text_pos_haplotype_start && !found_last_common) {
             auto t_lf_start = high_resolution_clock::now();
@@ -886,7 +925,10 @@ vector<TagInfo> find_tags_in_interval(FastLocate& r_index, SampledTagArray& samp
     if (use_fast_path && !found_last_common) {
         auto elapsed_ms = duration_cast<milliseconds>(high_resolution_clock::now() - t_find_tags_start).count();
         cerr << "No last common node found between source and target in interval [" << seq_start << ", " << seq_end
-             << "] (extended search reached haplotype start); no mapping possible. (total time: " << elapsed_ms << " ms)" << endl;
+             << "] ("
+             << (!allow_extended_search ? "extended search disabled for this probe"
+                                        : "extended search exhausted")
+             << "); no mapping possible. (total time: " << elapsed_ms << " ms)" << endl;
         return {};
     }
 
