@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <limits>
 #include <chrono>
+#include <sstream>
 #include <functional>
 #include <sys/mman.h>
 
@@ -107,7 +108,8 @@ extern std::vector<TagInfo> find_tags_in_interval(
     const gbwt::FastLocate* gbwt_fast_locate,
     const gbwtgraph::GBWTGraph* graph,
     size_t target_seq_id,
-    FindTagsInIntervalTiming* out_timing);
+    FindTagsInIntervalTiming* out_timing,
+    bool allow_extended_search);
 
 // File-scope (not inside a namespace) so the extern matches the definition in
 // coordinate_translation.cpp, per the same convention as the structs above.
@@ -143,6 +145,78 @@ extern std::vector<TranslationResult> trace_coordinates_gbwt(
 // ── Local helpers ──────────────────────────────────────────────────────────
 
 namespace {
+
+// ── Phase profiling (opt-in via PANGENOME_PROFILE=1) ───────────────────────
+//
+// translate() is a nest of three loops (source fragment -> candidate target
+// path -> strand attempt) around three expensive primitives, so a slow query
+// says nothing about WHICH primitive was slow or how many times it ran. These
+// counters attribute wall-clock to each primitive and record the call counts
+// needed to tell "one pathological call" from "ten thousand cheap ones".
+//
+// thread_local because the middleware runs translate() on worker threads and
+// the numbers are per-query; zero overhead when the env var is unset (the
+// clock reads are behind `on`).
+struct TranslateProf {
+    bool on = false;
+
+    // Loop trip counts.
+    uint64_t fragments = 0;      ///< source sub-intervals Table 1 produced
+    uint64_t tgt_path_visits = 0;///< (fragment, candidate target path) pairs
+    uint64_t attempts_fwd = 0;   ///< forward-strand traces attempted
+    uint64_t attempts_rev = 0;   ///< reverse-strand (gap) traces attempted
+    uint64_t gaps = 0;           ///< gaps forward left that were worth a retry
+
+    // Wall-clock per primitive, split by strand so the inversion retry's cost
+    // is visible separately from the ordinary forward pass.
+    double t1_lookup_ms = 0;
+    double t2_lookup_ms = 0;
+    double t2_segments_ms = 0;
+    double find_tags_fwd_ms = 0, find_tags_rev_ms = 0;
+    double common_fwd_ms = 0,    common_rev_ms = 0;
+    double trace_fwd_ms = 0,     trace_rev_ms = 0;
+
+    // Worst single call, to separate "one 40 s call" from "40 000 x 1 ms".
+    double max_find_tags_ms = 0, max_common_ms = 0, max_trace_ms = 0;
+
+    // Volume moved by each primitive.
+    uint64_t tags_found = 0;     ///< TagInfo records returned, summed
+    uint64_t points = 0;         ///< TranslationResult records returned, summed
+    uint64_t bp_probed = 0;      ///< source bases handed to find_tags_in_interval
+
+    // find_tags_in_interval's own internal breakdown, accumulated.
+    double ft_init_skip_lf_ms = 0, ft_p1_lf_ms = 0, ft_p1_tag_lookup_ms = 0;
+    double ft_p1_position_lookup_ms = 0, ft_p1_tag_map_ms = 0, ft_p1_fast_path_ms = 0;
+    uint64_t ft_lf_before_p1 = 0, ft_p1_lf_count = 0, ft_fast_path_hits = 0;
+};
+thread_local TranslateProf g_prof;
+
+bool prof_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("PANGENOME_PROFILE");
+        return e != nullptr && *e != '\0' && *e != '0';
+    }();
+    return on;
+}
+
+using prof_clock = std::chrono::steady_clock;
+inline double ms_since(const prof_clock::time_point& t0) {
+    return std::chrono::duration<double, std::milli>(prof_clock::now() - t0).count();
+}
+
+/// Fold one find_tags_in_interval timing record into the running totals.
+void prof_add_find_tags(const FindTagsInIntervalTiming& t) {
+    TranslateProf& P = g_prof;
+    P.ft_init_skip_lf_ms       += t.init_skip_lf_ms;
+    P.ft_p1_lf_ms              += t.phase1_lf_ms;
+    P.ft_p1_tag_lookup_ms      += t.phase1_tag_lookup_ms;
+    P.ft_p1_position_lookup_ms += t.phase1_position_lookup_ms;
+    P.ft_p1_tag_map_ms         += t.phase1_tag_map_ms;
+    P.ft_p1_fast_path_ms       += t.phase1_fast_path_ms;
+    P.ft_lf_before_p1          += t.num_lf_before_phase1;
+    P.ft_p1_lf_count           += t.phase1_lf_count;
+    if (t.used_fast_path) P.ft_fast_path_hits++;
+}
 
 /// One traced block together with the strand it was found on.
 struct StrandedTrace {
@@ -201,22 +275,53 @@ std::vector<StrandedTrace> trace_window_both_strands(
         if (b < a) return {};
         const size_t tgt_seq_id = 2 * tgt_path_id + (rev ? 1 : 0);
 
+        // Profiling: each of the three calls below is timed separately, because
+        // they have completely different cost models (RLBWT scan / decompressSA
+        // fan-out / GBWT LF walk) and a slow query is usually one of them alone.
+        const bool prof = prof_enabled();
+        if (prof) {
+            (rev ? g_prof.attempts_rev : g_prof.attempts_fwd)++;
+            g_prof.bp_probed += (b - a + 1);
+        }
+
+        FindTagsInIntervalTiming ft{};
+        auto t_ft = prof_clock::now();
+        // Round 2 (rev) is a speculative "is this hole an inversion?" probe. If the
+        // reverse sequence shares no node INSIDE the hole, there is no inversion
+        // here, and extending the search up the rest of the chromosome cannot
+        // establish one -- it only walks back to base 0 to return nothing. Round 1
+        // is the real query and keeps the fallback.
         std::vector<TagInfo> tags = find_tags_in_interval(
             rindex, sampled, src_seq_id, a, b,
-            &gbwt_index, &gbwt_flocate, &graph, tgt_seq_id, nullptr);
+            &gbwt_index, &gbwt_flocate, &graph, tgt_seq_id,
+            prof ? &ft : nullptr, /*allow_extended_search=*/!rev);
+        if (prof) {
+            double el = ms_since(t_ft);
+            (rev ? g_prof.find_tags_rev_ms : g_prof.find_tags_fwd_ms) += el;
+            g_prof.max_find_tags_ms = std::max(g_prof.max_find_tags_ms, el);
+            g_prof.tags_found += tags.size();
+            prof_add_find_tags(ft);
+        }
         if (diag && !rev)
             diag->max_tags = std::max<uint64_t>(diag->max_tags, tags.size());
         if (tags.empty()) return {};
 
+        auto t_cn = prof_clock::now();
         CommonNodes common = find_first_and_last_common_nodes_gbwt(
             gbwt_flocate, rindex, sampled, tags, src_seq_id, tgt_seq_id);
+        if (prof) {
+            double el = ms_since(t_cn);
+            (rev ? g_prof.common_rev_ms : g_prof.common_fwd_ms) += el;
+            g_prof.max_common_ms = std::max(g_prof.max_common_ms, el);
+        }
         if (!common.found) return {};
         if (diag && !diag->have_common) {
             diag->have_common = true;
             diag->common = common;
         }
 
-        return trace_coordinates_gbwt(
+        auto t_tr = prof_clock::now();
+        std::vector<TranslationResult> out_tr = trace_coordinates_gbwt(
             gbwt_index, gbwt_flocate, graph,
             src_seq_id, a, b, tgt_seq_id,
             common.first_source_offset, common.first_target_offset,
@@ -224,6 +329,13 @@ std::vector<StrandedTrace> trace_window_both_strands(
             common.first_tag_code,
             common.last_source_base,    common.last_target_base,
             common.last_tag_code);
+        if (prof) {
+            double el = ms_since(t_tr);
+            (rev ? g_prof.trace_rev_ms : g_prof.trace_fwd_ms) += el;
+            g_prof.max_trace_ms = std::max(g_prof.max_trace_ms, el);
+            g_prof.points += out_tr.size();
+        }
+        return out_tr;
     };
 
     // Round 1: the target's forward sequence, over the whole window.
@@ -257,6 +369,8 @@ std::vector<StrandedTrace> trace_window_both_strands(
         cursor = c + 1;
     }
     if (cursor <= hi && hi - cursor + 1 >= min_gap_bp) gaps.emplace_back(cursor, hi);
+
+    if (prof_enabled()) g_prof.gaps += gaps.size();
 
     for (const auto& g : gaps) {
         if (expired()) break;
@@ -524,7 +638,7 @@ Index::translatable_haplotypes_scored(const std::string& src_haplotype,
             std::vector<TagInfo> tags = find_tags_in_interval(
                 rindex, sampled, src_seq_id, pi.start, pi.end - 1,
                 &gbwt_index, gbwt_rindex_.get(), &graph,
-                std::numeric_limits<size_t>::max(), nullptr);
+                std::numeric_limits<size_t>::max(), nullptr, true);
             if (tags.empty()) continue;
 
             // Optionally subsample: probing every node is exact but each probe
@@ -768,7 +882,7 @@ Index::translate_no_table2(const std::string& src_haplotype,
         std::vector<TagInfo> all_tags = find_tags_in_interval(
             rindex, sampled, src_seq_id, seq_start_incl, seq_end_incl,
             gbwt_index_ptr, gbwt_rindex_.get(), &graph,
-            std::numeric_limits<size_t>::max(), nullptr);
+            std::numeric_limits<size_t>::max(), nullptr, true);
         if (diag) fd.unscoped_tags = all_tags.size();
         if (all_tags.empty()) { if (diag) { diag->no_tags++; close_fragment(); } continue; }
 
@@ -1036,6 +1150,12 @@ Index::translate(const std::string& src_haplotype,
                                    timeout_ms, timed_out);
     }
 
+    // Profiling is per-query: reset the thread-local accumulator so the report
+    // at the end describes THIS call and not everything the worker has run.
+    const bool prof = prof_enabled();
+    if (prof) g_prof = TranslateProf{};
+    const auto prof_t0 = prof_clock::now();
+
     // Cooperative deadline, same contract as translate_no_table2: checked
     // between source fragments and between candidate target paths, so a
     // pathological target is abandoned rather than stalling the request. It
@@ -1091,13 +1211,18 @@ Index::translate(const std::string& src_haplotype,
             "No paths found for source haplotype: " + src_haplotype);
 
     std::vector<PathInterval> source_intervals;
-    for (const std::string& name : source_path_names) {
-        std::vector<PathInterval> pis =
-            // lookup() end is EXCLUSIVE and the API is half-open: pass as-is.
-            table1_.lookup(name, global_start, global_end);
-        for (PathInterval& pi : pis)
-            source_intervals.push_back(pi);
+    {
+        auto t_t1 = prof_clock::now();
+        for (const std::string& name : source_path_names) {
+            std::vector<PathInterval> pis =
+                // lookup() end is EXCLUSIVE and the API is half-open: pass as-is.
+                table1_.lookup(name, global_start, global_end);
+            for (PathInterval& pi : pis)
+                source_intervals.push_back(pi);
+        }
+        if (prof) g_prof.t1_lookup_ms += ms_since(t_t1);
     }
+    if (prof) g_prof.fragments = source_intervals.size();
     if (source_intervals.empty())
         return {};
 
@@ -1122,8 +1247,10 @@ Index::translate(const std::string& src_haplotype,
         size_t local_end   = pi.end;
         if (local_end <= local_start) continue;
 
+        auto t_t2 = prof_clock::now();
         std::vector<TargetInterval> tgt_intervals =
             table2_.lookup(src_path_id, tgt_key, local_start, local_end);
+        if (prof) g_prof.t2_lookup_ms += ms_since(t_t2);
         if (tgt_intervals.empty()) continue;
 
         size_t src_seq_id = 2 * src_path_id;
@@ -1150,11 +1277,14 @@ Index::translate(const std::string& src_haplotype,
         }
         if (distinct_tgt_paths.empty()) continue;
 
+        auto t_seg = prof_clock::now();
         std::vector<IntervalMapping> segs =
             table2_.segments(src_path_id, tgt_key);
+        if (prof) g_prof.t2_segments_ms += ms_since(t_seg);
 
         for (size_t tgt_path_id : distinct_tgt_paths) {
             if (past_deadline()) break;
+            if (prof) g_prof.tgt_path_visits++;
             size_t extent_start = local_end, extent_end = local_start;
             for (const IntervalMapping& m : segs) {
                 if (m.tgt_path_id != tgt_path_id) continue;
@@ -1247,6 +1377,52 @@ Index::translate(const std::string& src_haplotype,
         // as forward.
         ti.strand    = ht.target_reverse ? '-' : '+';
         results.push_back(ti);
+    }
+    if (prof) {
+        const TranslateProf& P = g_prof;
+        const double total = ms_since(prof_t0);
+        const double ft = P.find_tags_fwd_ms + P.find_tags_rev_ms;
+        const double cn = P.common_fwd_ms    + P.common_rev_ms;
+        const double tr = P.trace_fwd_ms     + P.trace_rev_ms;
+        const double tbl = P.t1_lookup_ms + P.t2_lookup_ms + P.t2_segments_ms;
+        auto pct = [&](double v) { return total > 0 ? 100.0 * v / total : 0.0; };
+        std::ostringstream o;
+        o.setf(std::ios::fixed); o.precision(1);
+        o << "\n[profile] translate " << src_haplotype << ":" << start << "-" << end
+          << " -> " << tgt_haplotype << "   TOTAL " << total << " ms\n"
+          << "[profile]   shape: fragments=" << P.fragments
+          << " target_path_visits=" << P.tgt_path_visits
+          << " attempts(fwd/rev)=" << P.attempts_fwd << "/" << P.attempts_rev
+          << " gaps_retried=" << P.gaps << "\n"
+          << "[profile]   volume: bp_probed=" << P.bp_probed
+          << " tags_found=" << P.tags_found
+          << " points=" << P.points
+          << " intervals_out=" << results.size() << "\n"
+          << "[profile]   ---- phase ----------------  ms        %      (fwd / rev)\n"
+          << "[profile]   table1.lookup               " << P.t1_lookup_ms   << "  " << pct(P.t1_lookup_ms) << "\n"
+          << "[profile]   table2.lookup               " << P.t2_lookup_ms   << "  " << pct(P.t2_lookup_ms) << "\n"
+          << "[profile]   table2.segments             " << P.t2_segments_ms << "  " << pct(P.t2_segments_ms) << "\n"
+          << "[profile]   find_tags_in_interval       " << ft << "  " << pct(ft)
+          << "   (" << P.find_tags_fwd_ms << " / " << P.find_tags_rev_ms << ")\n"
+          << "[profile]   find_first_last_common      " << cn << "  " << pct(cn)
+          << "   (" << P.common_fwd_ms << " / " << P.common_rev_ms << ")\n"
+          << "[profile]   trace_coordinates_gbwt      " << tr << "  " << pct(tr)
+          << "   (" << P.trace_fwd_ms << " / " << P.trace_rev_ms << ")\n"
+          << "[profile]   unattributed                " << (total - tbl - ft - cn - tr)
+          << "  " << pct(total - tbl - ft - cn - tr) << "\n"
+          << "[profile]   worst single call: find_tags=" << P.max_find_tags_ms
+          << " common=" << P.max_common_ms << " trace=" << P.max_trace_ms << " ms\n"
+          << "[profile]   find_tags_in_interval internals:"
+          << " init_skip_lf=" << P.ft_init_skip_lf_ms
+          << " p1_lf=" << P.ft_p1_lf_ms
+          << " p1_tag_lookup=" << P.ft_p1_tag_lookup_ms
+          << " p1_pos_lookup=" << P.ft_p1_position_lookup_ms
+          << " p1_tag_map=" << P.ft_p1_tag_map_ms
+          << " p1_fast_path=" << P.ft_p1_fast_path_ms << " (ms)\n"
+          << "[profile]     LF steps: before_phase1=" << P.ft_lf_before_p1
+          << " phase1=" << P.ft_p1_lf_count
+          << " fast_path_hits=" << P.ft_fast_path_hits << "/" << (P.attempts_fwd + P.attempts_rev) << "\n";
+        std::cerr << o.str() << std::flush;
     }
     if (timed_out) *timed_out = hit_deadline;
     return results;
