@@ -1483,6 +1483,29 @@ struct PathNode {
 // use_largest_offset controls offset selection:
 //   false: smallest RLBWT base + largest GBWT offset (both = earliest) -> for FIRST node
 //   true:  largest RLBWT base + smallest GBWT offset (both = latest) -> for LAST node
+// Fan-out accounting for the common-node search: decompressSA returns EVERY
+// path occurrence of a node, and we scan all of them to pick out two sequences.
+// In a 450-haplotype graph a conserved node can carry thousands of occurrences,
+// so this is quadratic-ish in disguise: tags x occurrences-per-tag. These
+// counters separate "many cheap calls" from "few enormous ones".
+struct CommonNodeStats {
+    size_t calls = 0;        ///< check_common_node invocations
+    size_t sa_entries = 0;   ///< SA values scanned, summed
+    size_t max_sa = 0;       ///< largest single decompressSA result
+    double sa_ms = 0.0;      ///< time inside decompressSA
+    size_t pass0_calls = 0;  ///< calls made by the unique-only pass
+    size_t pass1_calls = 0;  ///< calls made by the fallback pass
+    size_t hits = 0;         ///< calls that found the node on BOTH sequences
+    size_t colinear_rejected = 0;   ///< last-anchor candidates dropped by the
+                                    ///< colinearity gate
+    size_t nonunique_rejected = 0;  ///< candidates dropped by the pass-0 RLBWT
+                                    ///< uniqueness test (the real cost driver)
+    // Where the accepted anchors landed, to expose truncation.
+    size_t first_src = 0, first_tgt = 0, last_src = 0, last_tgt = 0;
+};
+thread_local CommonNodeStats g_common_stats;
+thread_local int g_common_pass = 0;
+
 bool check_common_node(
     const gbwt::FastLocate& gbwt_fast_locate,
     FastLocate& rlbwt_rindex,
@@ -1506,7 +1529,14 @@ bool check_common_node(
     }
     
     // Use GBWT FastLocate to find all paths visiting this node
+    g_common_stats.calls++;
+    (g_common_pass == 0 ? g_common_stats.pass0_calls : g_common_stats.pass1_calls)++;
+    auto t_sa = std::chrono::steady_clock::now();
     std::vector<gbwt::size_type> sa_values = gbwt_fast_locate.decompressSA(node);
+    g_common_stats.sa_ms += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_sa).count();
+    g_common_stats.sa_entries += sa_values.size();
+    g_common_stats.max_sa = std::max(g_common_stats.max_sa, sa_values.size());
     
     if (debug) {
         cerr << "    Found " << sa_values.size() << " path occurrences on this node" << endl;
@@ -1541,7 +1571,8 @@ bool check_common_node(
     if (source_visits.empty() || target_visits.empty()) {
         return false;
     }
-    
+    g_common_stats.hits++;
+
     // Found common node! Match visits based on offsets
     // Sort visits by offset (larger offset = earlier position in path)
     sort(source_visits.begin(), source_visits.end(),
@@ -1735,6 +1766,7 @@ CommonNodes find_first_and_last_common_nodes_gbwt(
     // risks picking a paralogous copy, which is how a 1 Mb request ended up
     // mapping 29 kb: the wrong copy bounded the target walk.
     for (int pass = 0; pass < 2 && !result.found; ++pass) {
+    g_common_pass = pass;
     for (size_t i = 0; i < source_tags.size(); i++) {
         const auto& tag_info = source_tags[i];
         size_t source_offset, target_offset, source_base, target_base;
@@ -1746,6 +1778,7 @@ CommonNodes find_first_and_last_common_nodes_gbwt(
                               source_offset, target_offset, source_base, target_base,
                               false, &src_occ, &tgt_occ)) {
             if (pass == 0 && (src_occ != 1 || tgt_occ != 1)) {
+                g_common_stats.nonunique_rejected++;
                 continue;   // not a unique anchor; leave it for pass 1
             }
             result.first_is_unique = (src_occ == 1 && tgt_occ == 1);
@@ -1756,6 +1789,8 @@ CommonNodes find_first_and_last_common_nodes_gbwt(
             result.first_target_base = target_base;
             result.first_tag_code = tag_info.tag_code;
             result.found = true;
+            g_common_stats.first_src = source_base;
+            g_common_stats.first_tgt = target_base;
             
             if (debug) {
                 cerr << "  ✓ Found FIRST common node (earliest in path)!" << endl;
@@ -1791,6 +1826,7 @@ CommonNodes find_first_and_last_common_nodes_gbwt(
     // the scan continues outward.
     bool last_found = false;
     for (int pass = 0; pass < 2 && !last_found; ++pass) {
+    g_common_pass = pass;
     for (size_t i = source_tags.size(); i > 0; i--) {
         const auto& tag_info = source_tags[i - 1];
         size_t source_offset, target_offset, source_base, target_base;
@@ -1806,17 +1842,43 @@ CommonNodes find_first_and_last_common_nodes_gbwt(
                               pass == 0 ? numeric_limits<size_t>::max()
                                         : result.first_target_base)) {
             if (pass == 0 && (src_occ != 1 || tgt_occ != 1)) {
+                g_common_stats.nonunique_rejected++;
                 continue;   // not unique; leave for the fallback pass
             }
             // Colinearity / plausibility gate.
-            if (source_base > result.first_source_base &&
+            // Colinearity gate, tunable so its cost/benefit can be measured:
+            //   PANGENOME_COLINEAR_OFF=1      disable entirely
+            //   PANGENOME_COLINEAR_SLACK_BP   absolute indel allowance (def 10000)
+            //   PANGENOME_COLINEAR_RATIO      multiplicative tolerance (def 2)
+            // Read per call rather than cached in a static, so one loaded
+            // process can sweep settings; getenv is trivial beside the ~50 ms
+            // RLBWT enumeration this gate sits behind.
+            const char* cg_off = getenv("PANGENOME_COLINEAR_OFF");
+            const bool gate_on = !(cg_off && *cg_off && *cg_off != '0');
+            if (gate_on &&
+                source_base > result.first_source_base &&
                 target_base > result.first_target_base) {
+                const char* e_sl = getenv("PANGENOME_COLINEAR_SLACK_BP");
+                const char* e_ra = getenv("PANGENOME_COLINEAR_RATIO");
+                const size_t slack = e_sl ? (size_t)max(0L, atol(e_sl)) : 10000;
+                // Default 10, not the original 2. A x2 bound rejects ordinary
+                // copy-number variation: on chr8:7.53-7.65Mb -> HG02257#1 the
+                // correct last anchor implied a 2.64x target expansion (79,121
+                // bp source vs 209,231 bp target) in the beta-defensin locus
+                // and was discarded as paralogous. That single rejection both
+                // truncated the result (37.8% -> 68.9% coverage once relaxed)
+                // and forced 3,054 further RLBWT enumerations (156s -> 0.14s).
+                // chr20, a collinear region, is byte-identical either way, and
+                // x10 still rejects the order-of-magnitude mismatch the gate
+                // was written to catch.
+                const double ratio = e_ra ? max(1.0, atof(e_ra)) : 10.0;
                 const size_t src_span = source_base - result.first_source_base;
                 const size_t tgt_span = target_base - result.first_target_base;
-                const size_t slack = 10000;   // absolute allowance for indels
-                const size_t lo = (src_span > slack) ? (src_span - slack) / 2 : 0;
-                const size_t hi = (src_span + slack) * 2;
+                const size_t lo = (src_span > slack)
+                                ? (size_t)((src_span - slack) / ratio) : 0;
+                const size_t hi = (size_t)((src_span + slack) * ratio);
                 if (tgt_span < lo || tgt_span > hi) {
+                    g_common_stats.colinear_rejected++;
                     if (debug) {
                         cerr << "    Rejecting last-anchor candidate: source span "
                              << src_span << " vs target span " << tgt_span
@@ -1833,6 +1895,8 @@ CommonNodes find_first_and_last_common_nodes_gbwt(
             result.last_source_base = source_base;
             result.last_target_base = target_base;
             result.last_tag_code = tag_info.tag_code;
+            g_common_stats.last_src = source_base;
+            g_common_stats.last_tgt = target_base;
             
             if (debug) {
                 cerr << "  ✓ Found LAST common node (latest in path)!" << endl;
