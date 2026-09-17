@@ -17,6 +17,7 @@
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
+#include <set>
 #include <stdexcept>
 #include <algorithm>
 #include <limits>
@@ -88,6 +89,24 @@ struct CommonNodes {
 // by hand, per the extern-struct convention used for the structs above). The
 // thread-local accumulator there records find_sequences_for_tag's LF cost;
 // we reset it before a build and read it after to report per-query diagnostics.
+// Mirror of coordinate_translation.cpp's CommonNodeStats, same hand-kept
+// convention as FindSeqStats below. Records decompressSA fan-out inside the
+// first/last common-node search, which dominates in segmental-duplication
+// regions where few nodes are unique and each is visited by many haplotypes.
+struct CommonNodeStats {
+    size_t calls = 0;
+    size_t sa_entries = 0;
+    size_t max_sa = 0;
+    double sa_ms = 0.0;
+    size_t pass0_calls = 0;
+    size_t pass1_calls = 0;
+    size_t hits = 0;
+    size_t colinear_rejected = 0;
+    size_t nonunique_rejected = 0;
+    size_t first_src = 0, first_tgt = 0, last_src = 0, last_tgt = 0;
+};
+extern thread_local CommonNodeStats g_common_stats;
+
 struct FindSeqStats {
     size_t calls = 0;
     size_t runs = 0;
@@ -1078,6 +1097,7 @@ Index::translate_no_table2(const std::string& src_haplotype,
         auto it_name = path_to_global_.find(ht.target_path_id);
         ti.haplotype = (it_name != path_to_global_.end()) ? it_name->second.first
                                                           : tgt_haplotype;
+        ti.target_path_id = static_cast<int64_t>(ht.target_path_id);
         ti.start = static_cast<int64_t>(ht.source_haplotype_offset);
         ti.end   = static_cast<int64_t>(ht.target_haplotype_offset);
         ti.strand = ht.target_reverse ? '-' : '+';
@@ -1153,7 +1173,8 @@ Index::translate(const std::string& src_haplotype,
     // Profiling is per-query: reset the thread-local accumulator so the report
     // at the end describes THIS call and not everything the worker has run.
     const bool prof = prof_enabled();
-    if (prof) g_prof = TranslateProf{};
+    if (prof) { g_prof = TranslateProf{}; g_common_stats = CommonNodeStats{};
+                g_find_seq_stats = FindSeqStats{}; }
     const auto prof_t0 = prof_clock::now();
 
     // Cooperative deadline, same contract as translate_no_table2: checked
@@ -1295,13 +1316,106 @@ Index::translate(const std::string& src_haplotype,
                 extent_end   = std::max(extent_end,   overlap_end);
             }
             if (extent_start >= extent_end) continue;
-
-            size_t extent_start_incl = extent_start;
-            size_t extent_end_incl   = extent_end - 1;
+            if (prof) {
+                // Table 2 already stores this pair as a LIST of blocks; the
+                // min/max above flattens them into one span and the trace then
+                // resolves that span with a single anchor pair. Counting the
+                // segments shows how much structure is being discarded.
+                size_t nseg = 0, seg_bp = 0;
+                for (const IntervalMapping& m : segs) {
+                    if (m.tgt_path_id != tgt_path_id) continue;
+                    size_t os = std::max(local_start, m.src_start);
+                    size_t oe = std::min(local_end,   m.src_end);
+                    if (os >= oe) continue;
+                    nseg++; seg_bp += (oe - os);
+                }
+                // Whole-key view: how many target PATHS this source path can
+                // reach for this haplotype, and how many the query range hits.
+                // "one block per target path" only bites when the key routes to
+                // a single path; if it routes to several, translate() already
+                // emits several blocks.
+                std::set<size_t> all_paths, overlap_paths;
+                for (const IntervalMapping& m : segs) {
+                    all_paths.insert(m.tgt_path_id);
+                    if (std::max(local_start, m.src_start) < std::min(local_end, m.src_end))
+                        overlap_paths.insert(m.tgt_path_id);
+                }
+                std::cerr << "[profile]   T2 KEY view: segments=" << segs.size()
+                          << " distinct_tgt_paths(all)=" << all_paths.size()
+                          << " distinct_tgt_paths(overlapping query)="
+                          << overlap_paths.size() << std::endl;
+                std::cerr << "[profile]   T2 segments for tgt_path " << tgt_path_id
+                          << ": n=" << nseg << " covering " << seg_bp
+                          << " bp; collapsed extent=[" << extent_start << ","
+                          << extent_end << ") = " << (extent_end - extent_start)
+                          << " bp; has_target_coords=" << table2_.has_target_coords()
+                          << std::endl;
+            }
 
             auto it_tgt = path_to_global_.find(tgt_path_id);
             if (it_tgt == path_to_global_.end()) continue;
             size_t tgt_subpath_start = it_tgt->second.second;
+
+            // Trace each Table 2 SEGMENT separately rather than the merged
+            // [min,max] extent.
+            //
+            // A segment is one contiguous source block that the table says maps
+            // to this target path. Two blocks separated by a rearrangement are
+            // two DIFFERENT alignments, and a single anchor pair cannot describe
+            // both: collapsing them to one extent forces the trace to span the
+            // gap, which is what made the colinearity check reject the far
+            // anchor and truncate the result.
+            //
+            // This is a no-op on the current table, whose --merge-gap of 100 kb
+            // exceeds a typical query so only one segment ever overlaps. It is
+            // what lets a finer-merge-gap rebuild actually produce more blocks
+            // instead of more segments that get flattened again.
+            //
+            // PANGENOME_T2_PER_SEGMENT=0 restores the merged-extent behaviour;
+            // PANGENOME_T2_MAX_SEGMENTS caps the per-target-path segment count
+            // so a pathologically fragmented pair cannot fan out without bound
+            // (over the cap we fall back to the single merged extent).
+            static const bool per_segment = [] {
+                const char* e = std::getenv("PANGENOME_T2_PER_SEGMENT");
+                return !(e && *e && *e == '0');
+            }();
+            static const size_t max_segments = [] {
+                const char* e = std::getenv("PANGENOME_T2_MAX_SEGMENTS");
+                if (e) { long v = std::atol(e); if (v > 0) return (size_t)v; }
+                return (size_t)64;
+            }();
+
+            std::vector<std::pair<size_t, size_t>> windows;   // [start, end) src
+            if (per_segment) {
+                for (const IntervalMapping& m : segs) {
+                    if (m.tgt_path_id != tgt_path_id) continue;
+                    size_t os = std::max(local_start, m.src_start);
+                    size_t oe = std::min(local_end,   m.src_end);
+                    if (os >= oe) continue;
+                    windows.emplace_back(os, oe);
+                }
+                // Overlapping/adjacent segments would re-trace the same bases
+                // and emit duplicate points, so coalesce touching ones.
+                std::sort(windows.begin(), windows.end());
+                std::vector<std::pair<size_t, size_t>> merged;
+                for (const auto& w : windows) {
+                    if (!merged.empty() && w.first <= merged.back().second)
+                        merged.back().second = std::max(merged.back().second, w.second);
+                    else
+                        merged.push_back(w);
+                }
+                windows.swap(merged);
+                if (windows.size() > max_segments) windows.clear();
+            }
+            if (windows.empty()) windows.emplace_back(extent_start, extent_end);
+            if (prof) {
+                std::cerr << "[profile]   tgt_path " << tgt_path_id << ": tracing "
+                          << windows.size() << " window(s)" << std::endl;
+            }
+
+            for (const auto& win : windows) {
+            size_t extent_start_incl = win.first;
+            size_t extent_end_incl   = win.second - 1;
 
             // Resolve this extent on BOTH strands. Table 2 stores no strand
             // at all -- it only says "this source range has a translation on
@@ -1347,6 +1461,7 @@ Index::translate(const std::string& src_haplotype,
                     all_raw.push_back(ht);
                 }
             }
+            }   // per-segment window
         }
     }
 
@@ -1366,6 +1481,7 @@ Index::translate(const std::string& src_haplotype,
         // The contig is known from the resolved target path id; fall back to
         // the queried haplotype name if it isn't in the path→name map.
         auto it_name = path_to_global_.find(ht.target_path_id);
+        ti.target_path_id = static_cast<int64_t>(ht.target_path_id);
         ti.haplotype = (it_name != path_to_global_.end())
                        ? it_name->second.first
                        : tgt_haplotype;
@@ -1410,6 +1526,35 @@ Index::translate(const std::string& src_haplotype,
           << "   (" << P.trace_fwd_ms << " / " << P.trace_rev_ms << ")\n"
           << "[profile]   unattributed                " << (total - tbl - ft - cn - tr)
           << "  " << pct(total - tbl - ft - cn - tr) << "\n"
+          << "[profile]   common-node decompressSA fan-out:"
+          << " calls=" << g_common_stats.calls
+          << " (pass0=" << g_common_stats.pass0_calls
+          << " pass1=" << g_common_stats.pass1_calls << ")"
+          << " hits=" << g_common_stats.hits
+          << " sa_entries=" << g_common_stats.sa_entries
+          << " max_sa=" << g_common_stats.max_sa
+          << " sa_ms=" << g_common_stats.sa_ms
+          << " avg_sa_per_call="
+          << (g_common_stats.calls ? g_common_stats.sa_entries / g_common_stats.calls : 0)
+          << "\n"
+          << "[profile]   anchors chosen: first src=" << g_common_stats.first_src
+          << " tgt=" << g_common_stats.first_tgt
+          << " | last src=" << g_common_stats.last_src
+          << " tgt=" << g_common_stats.last_tgt
+          << "   rejected: nonunique=" << g_common_stats.nonunique_rejected
+          << " colinear=" << g_common_stats.colinear_rejected
+ << "\n"
+          << "[profile]   find_sequences_for_tag (RLBWT enumeration):"
+          << " calls=" << g_find_seq_stats.calls
+          << " runs=" << g_find_seq_stats.runs
+          << " lf_steps=" << g_find_seq_stats.lf_steps
+          << " visits=" << g_find_seq_stats.visits
+          << " total_ms=" << g_find_seq_stats.total_ms
+          << " avg_visits_per_call="
+          << (g_find_seq_stats.calls ? g_find_seq_stats.visits / g_find_seq_stats.calls : 0)
+          << " avg_ms_per_call="
+          << (g_find_seq_stats.calls ? g_find_seq_stats.total_ms / g_find_seq_stats.calls : 0.0)
+          << "\n"
           << "[profile]   worst single call: find_tags=" << P.max_find_tags_ms
           << " common=" << P.max_common_ms << " trace=" << P.max_trace_ms << " ms\n"
           << "[profile]   find_tags_in_interval internals:"

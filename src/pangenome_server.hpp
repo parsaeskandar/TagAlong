@@ -48,6 +48,18 @@ struct TranslatedInterval {
     int64_t start;
     int64_t end;
     char strand;  // '+' or '-'
+    /// GBWT path id of the target subpath this correspondence came from.
+    ///
+    /// The contig NAME is not enough to separate alignments: two subpaths of
+    /// the SAME contig are distinct alignments, and a source range homologous
+    /// to two copies on one contig yields one correspondence per copy. Folding
+    /// those together as though they were one chain makes target-source flip at
+    /// nearly every point, shredding a clean result into tens of thousands of
+    /// one-base blocks (measured on chr8:7.53-7.65Mb: 1 path -> 1 interval,
+    /// 2 paths -> 70,614). Callers MUST group by this before folding.
+    ///
+    /// -1 when unset, so a consumer built against the older struct still works.
+    int64_t target_path_id = -1;
 };
 
 /// Per-source-fragment accounting for one translation, so it is possible to see

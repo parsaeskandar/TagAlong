@@ -74,12 +74,22 @@ def _fold_to_intervals(raw) -> List[Dict[str, Any]]:
     A direction reversal (e.g. an inversion) or a different contig naturally
     breaks into separate pieces — this is what yields the agreed 0..N intervals.
     """
-    by_contig: Dict[str, List[Tuple[int, int]]] = {}
+    # Group by (contig, target path), NOT contig alone. Two GBWT subpaths of one
+    # contig are separate alignments -- a source range homologous to two copies
+    # on the same contig produces a correspondence per copy. Bucketed together
+    # and sorted by source they interleave, target-source flips at almost every
+    # point, and the run/offset logic below shreds both into one-base pieces
+    # (chr8:7.53-7.65Mb measured 1 interval for a 1-path target, 70,614 for a
+    # 2-path one at the same coverage). Keyed apart, each alignment folds
+    # cleanly and is emitted as its own block, which is the intended 0..N.
+    # getattr keeps this working against a liftover_ext built before the field.
+    by_contig: Dict[Tuple[str, int], List[Tuple[int, int]]] = {}
     for p in raw:
-        by_contig.setdefault(p.haplotype, []).append((int(p.start), int(p.end)))
+        by_contig.setdefault((p.haplotype, int(getattr(p, "target_path_id", -1))),
+                             []).append((int(p.start), int(p.end)))
 
     out: List[Dict[str, Any]] = []
-    for contig, pts in by_contig.items():
+    for (contig, _tgt_path), pts in by_contig.items():
         pts.sort()  # source ascending (ties: target ascending)
         i, n = 0, len(pts)
         while i < n:
@@ -105,6 +115,9 @@ def _fold_to_intervals(raw) -> List[Dict[str, Any]]:
                 "strand": "-" if direction < 0 else "+",
             })
             i = j + 1
+    # Deterministic order: with several (contig, path) groups the dict's
+    # insertion order would otherwise leak into the response.
+    out.sort(key=lambda b: (b["haplotype"], b["start"], b["end"]))
     return out
 
 
@@ -131,12 +144,22 @@ def _fold_to_blocks(raw) -> List[Dict[str, Any]]:
     orientation in `strand`. Substituted bases are spanned by the block, as in a
     chain.
     """
-    by_contig: Dict[str, List[Tuple[int, int]]] = {}
+    # Group by (contig, target path), NOT contig alone. Two GBWT subpaths of one
+    # contig are separate alignments -- a source range homologous to two copies
+    # on the same contig produces a correspondence per copy. Bucketed together
+    # and sorted by source they interleave, target-source flips at almost every
+    # point, and the run/offset logic below shreds both into one-base pieces
+    # (chr8:7.53-7.65Mb measured 1 interval for a 1-path target, 70,614 for a
+    # 2-path one at the same coverage). Keyed apart, each alignment folds
+    # cleanly and is emitted as its own block, which is the intended 0..N.
+    # getattr keeps this working against a liftover_ext built before the field.
+    by_contig: Dict[Tuple[str, int], List[Tuple[int, int]]] = {}
     for p in raw:
-        by_contig.setdefault(p.haplotype, []).append((int(p.start), int(p.end)))
+        by_contig.setdefault((p.haplotype, int(getattr(p, "target_path_id", -1))),
+                             []).append((int(p.start), int(p.end)))
 
     out: List[Dict[str, Any]] = []
-    for contig, pts in by_contig.items():
+    for (contig, _tgt_path), pts in by_contig.items():
         pts.sort()
         i, n = 0, len(pts)
         while i < n:

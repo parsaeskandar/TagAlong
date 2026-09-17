@@ -16,6 +16,7 @@ PYBIND11_MODULE(liftover_ext, m) {
         .def_readwrite("start",     &TranslatedInterval::start)
         .def_readwrite("end",       &TranslatedInterval::end)
         .def_readwrite("strand",    &TranslatedInterval::strand)
+        .def_readwrite("target_path_id", &TranslatedInterval::target_path_id)
         .def("__repr__", [](const TranslatedInterval& ti) {
             return "<TranslatedInterval haplotype='" + ti.haplotype +
                    "' start=" + std::to_string(ti.start) +
