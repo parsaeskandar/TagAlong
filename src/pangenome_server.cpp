@@ -115,6 +115,16 @@ struct FindSeqStats {
     size_t last_run_nav_steps = 0;
     size_t last_run_length = 0;
     double total_ms = 0.0;
+    double rank_ms = 0.0;
+    double select_ms = 0.0;
+    double runspan_ms = 0.0;
+    double runid_ms = 0.0;
+    double sample_ms = 0.0;
+    double nav_ms = 0.0;
+    double walk_ms = 0.0;
+    double unpack_ms = 0.0;
+    size_t nav_steps = 0;
+    size_t walk_steps = 0;
 };
 extern thread_local FindSeqStats g_find_seq_stats;
 
@@ -2075,6 +2085,120 @@ Index::haplotype_coverage(const std::string& gaf_str, double min_coverage,
     return out;
 }
 
+AnchorWalkSim Index::simulate_anchor_walk(
+    const std::string& gaf_str,
+    const std::string& target_haplotype) const
+{
+    AnchorWalkSim out;
+    if (!loaded_) throw std::runtime_error("simulate_anchor_walk before load()");
+    const auto t0 = prof_clock::now();
+
+    auto mappings = gaf_to_source_mappings(gaf_str, gbz_->graph);
+    if (mappings.empty()) { out.status = "parse_error"; return out; }
+
+    // Resolve the target name to subpaths, then pick the one the read touches
+    // most -- same selection the real build makes.
+    std::vector<std::string> names = table1_.names();
+    std::vector<std::string> matched;
+    for (const auto& nm : names) if (nm == target_haplotype) matched.push_back(nm);
+    if (matched.empty()) {
+        std::string pre = target_haplotype;
+        if (pre.empty() || pre.back() != '#') pre += '#';
+        for (const auto& nm : names)
+            if (nm.size() >= pre.size() && nm.compare(0, pre.size(), pre) == 0)
+                matched.push_back(nm);
+    }
+    std::unordered_set<size_t> pid_set;
+    for (const auto& nm : matched)
+        for (const auto& sp : table1_.subpaths(nm)) pid_set.insert(sp.path_id);
+    if (pid_set.empty()) { out.status = "unknown_path"; return out; }
+
+    // One decompressSA pass: pick the touched subpath with the most hits, and
+    // cache each node's SA values so we do not decompress twice.
+    std::unordered_map<gbwt::node_type, std::vector<gbwt::size_type>> sa_cache;
+    std::unordered_map<size_t, size_t> hits_by_pid;
+    for (const auto& m : mappings) {
+        gbwt::node_type node = gbwt::Node::encode(
+            static_cast<gbwt::node_type>(m.node_id), m.is_reverse);
+        if (sa_cache.count(node)) continue;
+        auto sa = gbwt_rindex_->decompressSA(node);
+        for (gbwt::size_type v : sa) {
+            size_t pid = static_cast<size_t>(gbwt_rindex_->seqId(v)) / 2;
+            if (pid_set.count(pid)) hits_by_pid[pid]++;
+        }
+        sa_cache.emplace(node, std::move(sa));
+    }
+    if (hits_by_pid.empty()) { out.status = "no_common_nodes"; return out; }
+    size_t best_pid = hits_by_pid.begin()->first;
+    for (const auto& kv : hits_by_pid) if (kv.second > hits_by_pid[best_pid]) best_pid = kv.first;
+    const size_t tgt_seq = 2 * best_pid;   // forward sequence of that subpath
+
+    // expected[node] = target occurrences, with their node offsets along the path
+    std::unordered_map<gbwt::node_type, std::vector<size_t>> occ;
+    for (size_t i = 0; i < mappings.size(); ++i) {
+        gbwt::node_type node = gbwt::Node::encode(
+            static_cast<gbwt::node_type>(mappings[i].node_id), mappings[i].is_reverse);
+        if (occ.count(node)) continue;
+        auto it = sa_cache.find(node);
+        if (it == sa_cache.end()) continue;
+        std::vector<size_t> offs;
+        for (gbwt::size_type v : it->second)
+            if (static_cast<size_t>(gbwt_rindex_->seqId(v)) == tgt_seq)
+                offs.push_back(static_cast<size_t>(gbwt_rindex_->seqOffset(v)));
+        if (!offs.empty()) { std::sort(offs.begin(), offs.end()); occ.emplace(node, std::move(offs)); }
+    }
+    if (occ.empty()) { out.status = "no_common_nodes"; return out; }
+
+    // F = occurrences of the FIRST mapped node (read order) the target visits.
+    std::vector<size_t> F;
+    for (size_t i = 0; i < mappings.size(); ++i) {
+        gbwt::node_type node = gbwt::Node::encode(
+            static_cast<gbwt::node_type>(mappings[i].node_id), mappings[i].is_reverse);
+        auto it = occ.find(node);
+        if (it != occ.end()) { F = it->second; break; }
+    }
+    if (F.empty()) { out.status = "no_common_nodes"; return out; }
+    const size_t start_min = F.front();
+
+    size_t max_off = 0;
+    for (const auto& kv : occ) max_off = std::max(max_off, kv.second.back());
+    // Realistic cap: no walk runs further than a few times the read's node count.
+    const size_t cap = mappings.size() * 3;
+
+    // DIRECTION: in the GBWT a LARGER seqOffset is EARLIER in the path (the
+    // opposite of the RLBWT) -- see the note in check_common_node. So walking
+    // forward means offsets DECREASE, and starting from every occurrence of the
+    // first node covers offsets <= max(F). Both directions are computed so the
+    // data says which is right instead of relying on that comment.
+    const size_t start_fwd = F.back();    // max(F): forward == decreasing offset
+    size_t min_off = SIZE_MAX;
+    for (const auto& kv : occ) min_off = std::min(min_off, kv.second.front());
+
+    size_t agree_inc = 0;                 // the other reading, as a sanity check
+    for (const auto& kv : occ) {
+        const std::vector<size_t>& offs = kv.second;
+        out.mapped_nodes++;
+        out.total_occurrences += offs.size();
+        size_t seen = 0, seen_capped = 0, seen_inc = 0;
+        for (size_t o : offs) {
+            if (o <= start_fwd) seen++;                       // forward = decreasing
+            if (o >= start_min) seen_inc++;                   // opposite reading
+            for (size_t f : F)
+                if (o <= f && f - o <= cap) { seen_capped++; break; }
+        }
+        if (seen == offs.size()) out.nodes_agree++; else out.nodes_fallback++;
+        if (seen_capped == offs.size()) out.capped_agree++; else out.capped_fallback++;
+        if (seen_inc == offs.size()) agree_inc++;
+        out.occ_missed += (offs.size() - seen);
+    }
+    out.first_node_occ = F.size();
+    out.nodes_agree_increasing = agree_inc;
+    out.walk_span_nodes = (start_fwd > min_off) ? (start_fwd - min_off) : 0;
+    out.status = "ok";
+    out.sim_ms = ms_since(t0);
+    return out;
+}
+
 AnchorBuildPyResult Index::build_surject_anchors(
     const std::string& gaf_str,
     const std::string& target_haplotype) const
@@ -2085,7 +2209,12 @@ AnchorBuildPyResult Index::build_surject_anchors(
         throw std::runtime_error("Index::build_surject_anchors called before load()");
     }
 
+    // Stage timers: find_seq dominates, but "dominates" should be measured, not
+    // assumed -- GAF parsing, T1 name resolution and the per-subpath loop are all
+    // candidates and none were timed before.
+    const auto _t_parse = prof_clock::now();
     auto source_mappings = gaf_to_source_mappings(gaf_str, gbz_->graph);
+    out.parse_ms = ms_since(_t_parse);
     if (source_mappings.empty()) {
         // Differentiate "couldn't parse anything" vs "alignment is empty":
         // peek at the GAF query name to choose. Either way we report empty.
@@ -2111,6 +2240,7 @@ AnchorBuildPyResult Index::build_surject_anchors(
     // extract-and-sum loop build_surject_anchors_for_path would otherwise run.
     // Passing it avoids a full target-path extraction per query.
     std::vector<std::pair<size_t, size_t>> target_path_ids;
+    const auto _t_resolve = prof_clock::now();
     {
         std::vector<std::string> t1_names = table1_.names();
         std::vector<std::string> matched_names;
@@ -2136,6 +2266,7 @@ AnchorBuildPyResult Index::build_surject_anchors(
             }
         }
     }
+    out.resolve_ms = ms_since(_t_resolve);
     if (target_path_ids.empty()) {
         out.status = "unknown_path";
         return out;
@@ -2169,6 +2300,7 @@ AnchorBuildPyResult Index::build_surject_anchors(
         len_by_pid[pid] = plen;
     }
 
+    const auto _t_touched = prof_clock::now();
     std::vector<std::pair<size_t, size_t>> touched;  // (path_id, length), first-seen order
     std::unordered_set<size_t> touched_seen;
     for (const panindexer::SourceMapping& sm : source_mappings) {
@@ -2189,14 +2321,19 @@ AnchorBuildPyResult Index::build_surject_anchors(
         }
     }
 
+    out.touched_scan_ms = ms_since(_t_touched);
+    out.n_touched_subpaths = touched.size();
+
     // Build anchors only for the touched subpaths, keeping the same "pick the
     // result with the most anchors" semantics as before.
+    const auto _t_build = prof_clock::now();
     std::vector<panindexer::AnchorBuildResult> results;
     results.reserve(touched.size());
     for (const auto& [pid, plen] : touched) {
         results.push_back(panindexer::build_surject_anchors_for_path(
             *gbz_, rindex, sampled, *gbwt_rindex_, source_mappings, pid, plen));
     }
+    out.build_ms = ms_since(_t_build);
 
     if (results.empty()) {
         // Name resolved, but the read shares no node with any of its subpaths.
@@ -2236,6 +2373,16 @@ AnchorBuildPyResult Index::build_surject_anchors(
 
     // Report the find_sequences_for_tag LF cost accumulated over this query.
     out.find_seq_calls     = g_find_seq_stats.calls;
+    out.fs_rank_ms    = g_find_seq_stats.rank_ms;
+    out.fs_select_ms  = g_find_seq_stats.select_ms;
+    out.fs_runspan_ms = g_find_seq_stats.runspan_ms;
+    out.fs_runid_ms   = g_find_seq_stats.runid_ms;
+    out.fs_sample_ms  = g_find_seq_stats.sample_ms;
+    out.fs_nav_ms     = g_find_seq_stats.nav_ms;
+    out.fs_walk_ms    = g_find_seq_stats.walk_ms;
+    out.fs_unpack_ms  = g_find_seq_stats.unpack_ms;
+    out.fs_nav_steps  = g_find_seq_stats.nav_steps;
+    out.fs_walk_steps = g_find_seq_stats.walk_steps;
     out.find_seq_runs      = g_find_seq_stats.runs;
     out.find_seq_lf_steps  = g_find_seq_stats.lf_steps;
     out.find_seq_visits    = g_find_seq_stats.visits;

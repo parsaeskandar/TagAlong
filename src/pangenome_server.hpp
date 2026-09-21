@@ -149,6 +149,34 @@ struct AnchorRecord {
     uint64_t gbwt_edge_end_offset = 0;
 };
 
+/// Measurement-only: would the "walk from every occurrence of the first common
+/// node, then verify with GBWT counts" strategy actually find every occurrence?
+///
+/// `expected` per node = target occurrences from decompressSA (whole path).
+/// `seen` per node     = occurrences a forward walk would cover.
+/// The walk only moves FORWARD, and starting from every occurrence of the first
+/// node means it covers [min(first-node offsets), ->). So an occurrence is
+/// missed exactly when it lies BEFORE that point. Nodes where seen == expected
+/// need no RLBWT lookup; the rest fall back.
+struct AnchorWalkSim {
+    std::string status;
+    uint64_t mapped_nodes = 0;        ///< read nodes the target visits
+    uint64_t total_occurrences = 0;   ///< summed expected[] over those nodes
+    uint64_t first_node_occ = 0;      ///< |F| -- walks we would start
+    uint64_t nodes_agree = 0;         ///< seen == expected  -> walk suffices
+    uint64_t nodes_fallback = 0;      ///< seen <  expected  -> needs the tags
+    uint64_t occ_missed = 0;          ///< occurrences before min(F)
+    /// Same, but with each walk capped at `cap` nodes instead of running to the
+    /// path end -- the realistic implementation.
+    uint64_t capped_agree = 0;
+    uint64_t capped_fallback = 0;
+    uint64_t walk_span_nodes = 0;     ///< node span the walk must cover
+    /// Same count under the OPPOSITE offset-direction assumption. If this is
+    /// the one near 100%, the direction below is backwards.
+    uint64_t nodes_agree_increasing = 0;
+    double   sim_ms = 0.0;
+};
+
 struct AnchorBuildPyResult {
     /// One of: "ok", "empty_alignment", "unknown_path", "no_common_nodes".
     std::string status;
@@ -194,6 +222,19 @@ struct AnchorBuildPyResult {
     /// n_source_mappings — these confirm the call explosion is the subpath loop.
     uint64_t n_target_subpaths = 0;
     uint64_t n_source_mappings = 0;
+
+    /// Whole-stage timings, so no part of the build is unaccounted for.
+    double parse_ms = 0.0;         ///< GAF -> SourceMappings
+    double resolve_ms = 0.0;       ///< target name -> T1 subpath ids
+    double touched_scan_ms = 0.0;  ///< decompressSA pass picking touched subpaths
+    double build_ms = 0.0;         ///< the per-subpath anchor build itself
+    uint64_t n_touched_subpaths = 0;
+
+    /// find_sequences_for_tag internal breakdown (see FindSeqStats).
+    double fs_rank_ms = 0.0, fs_select_ms = 0.0, fs_runspan_ms = 0.0;
+    double fs_runid_ms = 0.0, fs_sample_ms = 0.0;
+    double fs_nav_ms = 0.0, fs_walk_ms = 0.0, fs_unpack_ms = 0.0;
+    uint64_t fs_nav_steps = 0, fs_walk_steps = 0;
 };
 
 class Index {
@@ -338,6 +379,12 @@ public:
     /// "no_common_nodes", "parse_error".
     AnchorBuildPyResult build_surject_anchors(const std::string& gaf_str,
                                               const std::string& target_haplotype) const;
+
+    /// Measurement only: simulate the walk-plus-GBWT-count strategy and report
+    /// how often the walk alone would suffice. Changes nothing; runs no RLBWT
+    /// lookups at all, so it is cheap (decompressSA only).
+    AnchorWalkSim simulate_anchor_walk(const std::string& gaf_str,
+                                       const std::string& target_haplotype) const;
 
 private:
     bool loaded_ = false;

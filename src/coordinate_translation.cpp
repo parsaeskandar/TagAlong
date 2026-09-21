@@ -68,6 +68,18 @@ struct FindSeqStats {
     size_t last_run_nav_steps = 0;// LF steps to navigate from the sample to the LAST run's start
     size_t last_run_length = 0;   // number of positions in the LAST run iterated
     double total_ms = 0.0;        // wall-clock time spent in find_sequences_for_tag
+    // Per-sub-step breakdown. The loops are timed as a whole, never per LF step:
+    // at ~847M steps a clock read per step would dominate what it measures.
+    double rank_ms = 0.0;         // wavelet-tree rank, once per call
+    double select_ms = 0.0;       // wavelet-tree select, once per tag run
+    double runspan_ms = 0.0;      // sampled.run_span
+    double runid_ms = 0.0;        // r_index.run_id_and_offset_at
+    double sample_ms = 0.0;       // r_index.getSample
+    double nav_ms = 0.0;          // navigation loop: sample -> run start
+    double walk_ms = 0.0;         // collection loop: one locateNext per position
+    double unpack_ms = 0.0;       // r_index.unpack + NodeVisit push_back
+    size_t nav_steps = 0;         // LF steps spent navigating
+    size_t walk_steps = 0;        // LF steps spent collecting
 };
 thread_local FindSeqStats g_find_seq_stats;
 
@@ -802,12 +814,45 @@ vector<TagInfo> find_tags_in_interval(FastLocate& r_index, SampledTagArray& samp
     static const size_t extend_cap_bp = []() -> size_t {
         const char* e = std::getenv("PANGENOME_EXTEND_CAP_BP");
         if (e) return static_cast<size_t>(std::max(0L, std::atol(e)));
-        return 1000000;   // 1 Mb
+        return 100000;   // 100 kb; see the measurements below for why not 1 Mb
     }();
+
+    // (3) Only extend for a SMALL interval.
+    //
+    // The extension exists to rescue an interval too small to cover a sampled
+    // tag run. On a large interval it is not merely expensive but pointless: if
+    // nothing in 100 kb is shared with the target, the target has no homology
+    // here, and an anchor dragged in from outside the interval maps almost
+    // nothing regardless -- FragmentDiag::scoped_tags in pangenome_server.hpp
+    // already documents the single-outside-anchor case as mapping ~nothing.
+    //
+    // Measured on two 100 kb windows that are INVERTED relative to the target,
+    // chr8:11,898,756 and chrX:7,815,388 -> HG02257#1. The forward pass found
+    // no shared node, walked the full 1 Mb cap (1,100,277 and 1,200,153 LF
+    // steps) and returned NOTHING, costing 10.5 s and 5.9 s of a 10.6 s and
+    // 6.7 s query. The reverse-strand retry then produced the complete answer
+    // in ~43 ms. The entire extension bought zero results in both cases.
+    //
+    // The cap above also came down from 1 Mb to 100 kb: at the ~9.5 us per LF
+    // step these regions actually cost, a full 1 Mb walk is ~10 s, not the ~4 s
+    // originally estimated from chr20.
+    static const size_t extend_max_interval_bp = []() -> size_t {
+        const char* e = std::getenv("PANGENOME_EXTEND_MAX_INTERVAL_BP");
+        if (e) return static_cast<size_t>(std::max(0L, std::atol(e)));
+        return 10000;   // 0 disables the size test, restoring the old behaviour
+    }();
+    const size_t interval_bp = (seq_end >= seq_start) ? (seq_end - seq_start + 1) : 0;
+    const bool interval_small_enough =
+        (extend_max_interval_bp == 0) || (interval_bp <= extend_max_interval_bp);
 
     if (use_fast_path && !found_last_common && !allow_extended_search) {
         if (debug) {
             cerr << "  [extend] No common node in interval; extended search disabled by caller" << endl;
+        }
+    } else if (use_fast_path && !found_last_common && !interval_small_enough) {
+        if (debug) {
+            cerr << "  [extend] No common node in " << interval_bp
+                 << " bp interval; too large to be a sampling gap, skipping extension" << endl;
         }
     } else if (use_fast_path && !found_last_common) {
         size_t text_pos_haplotype_start = r_index.pack(source_seq_id, 0);
@@ -927,6 +972,7 @@ vector<TagInfo> find_tags_in_interval(FastLocate& r_index, SampledTagArray& samp
         cerr << "No last common node found between source and target in interval [" << seq_start << ", " << seq_end
              << "] ("
              << (!allow_extended_search ? "extended search disabled for this probe"
+                : !interval_small_enough ? "interval too large for extended search"
                                         : "extended search exhausted")
              << "); no mapping possible. (total time: " << elapsed_ms << " ms)" << endl;
         return {};
@@ -1084,7 +1130,10 @@ vector<NodeVisit> find_sequences_for_tag(FastLocate& r_index, SampledTagArray& s
     }
 
     const auto& wm = sampled.values();
+    auto _t_rank = high_resolution_clock::now();
     size_t total_occ = wm.rank(wm.size(), tag_code);
+    g_find_seq_stats.rank_ms += duration<double, std::milli>(
+        high_resolution_clock::now() - _t_rank).count();
     
     if (debug) {
         cerr << "  wm.size()=" << wm.size() << ", total_occ=" << total_occ << endl;
@@ -1107,7 +1156,10 @@ vector<NodeVisit> find_sequences_for_tag(FastLocate& r_index, SampledTagArray& s
             cerr << "  Processing occurrence " << j << "/" << total_occ << endl;
         }
         
+        auto _t_sel = high_resolution_clock::now();
         size_t tag_run_id = wm.select(j, tag_code);
+        g_find_seq_stats.select_ms += duration<double, std::milli>(
+            high_resolution_clock::now() - _t_sel).count();
         if (debug) {
             cerr << "    tag_run_id=" << tag_run_id << endl;
         }
@@ -1117,7 +1169,10 @@ vector<NodeVisit> find_sequences_for_tag(FastLocate& r_index, SampledTagArray& s
             cerr << "    bwt_run_id=" << bwt_run_id << endl;
         }
         
+        auto _t_rs = high_resolution_clock::now();
         auto run_span = sampled.run_span(bwt_run_id);
+        g_find_seq_stats.runspan_ms += duration<double, std::milli>(
+            high_resolution_clock::now() - _t_rs).count();
         size_t locate_start = run_span.first;
         size_t locate_end = run_span.second;
         
@@ -1159,13 +1214,19 @@ vector<NodeVisit> find_sequences_for_tag(FastLocate& r_index, SampledTagArray& s
                 cerr << "      r_index.size() (num runs)=" << r_index.size() << endl;
             }
             
+            auto _t_rid = high_resolution_clock::now();
             r_index.run_id_and_offset_at(locate_start, rindex_run_id, run_start_pos);
+            g_find_seq_stats.runid_ms += duration<double, std::milli>(
+                high_resolution_clock::now() - _t_rid).count();
             
             if (debug) {
                 cerr << "      rindex_run_id=" << rindex_run_id << ", run_start_pos=" << run_start_pos << endl;
             }
             
+            auto _t_gs = high_resolution_clock::now();
             packed_pos = r_index.getSample(rindex_run_id);
+            g_find_seq_stats.sample_ms += duration<double, std::milli>(
+                high_resolution_clock::now() - _t_gs).count();
             
             if (debug) {
                 cerr << "      initial packed_pos=" << packed_pos << endl;
@@ -1179,15 +1240,13 @@ vector<NodeVisit> find_sequences_for_tag(FastLocate& r_index, SampledTagArray& s
                      << run_start_pos << " to locate_start=" << locate_start << endl;
             }
             
+            auto _t_nav = high_resolution_clock::now();
             for (size_t p = run_start_pos; p < locate_start; ++p) {
-                if (debug) {
-                    cerr << "      Before locateNext: p=" << p << ", packed_pos=" << packed_pos << endl;
-                }
                 packed_pos = r_index.locateNext(packed_pos);
-                if (debug) {
-                    cerr << "      After locateNext: p=" << p << ", packed_pos=" << packed_pos << endl;
-                }
             }
+            g_find_seq_stats.nav_ms += duration<double, std::milli>(
+                high_resolution_clock::now() - _t_nav).count();
+            g_find_seq_stats.nav_steps += (locate_start - run_start_pos);
             
             if (debug) {
                 cerr << "      After navigation: packed_pos=" << packed_pos << endl;
@@ -1195,6 +1254,7 @@ vector<NodeVisit> find_sequences_for_tag(FastLocate& r_index, SampledTagArray& s
         }
         
         // Process all positions in the run
+        auto _t_walk = high_resolution_clock::now();
         for (size_t pos = locate_start; pos <= locate_end; ++pos) {
             if (debug) {
                 cerr << "    Processing pos=" << pos << " (offset=" << (pos - locate_start) 
@@ -1231,7 +1291,10 @@ vector<NodeVisit> find_sequences_for_tag(FastLocate& r_index, SampledTagArray& s
             if (debug && ((pos - locate_start) % 100 == 0 || pos == locate_start || pos == locate_end)) {
                 cerr << "      About to unpack packed_pos=" << packed_pos << endl;
             }
+            auto _t_up = high_resolution_clock::now();
             auto pr = r_index.unpack(packed_pos);
+            g_find_seq_stats.unpack_ms += duration<double, std::milli>(
+                high_resolution_clock::now() - _t_up).count();
 
             size_t seq_id_found = pr.first;
             size_t offset_from_start = pr.second;
@@ -1248,8 +1311,10 @@ vector<NodeVisit> find_sequences_for_tag(FastLocate& r_index, SampledTagArray& s
             visit.tag_code = tag_code;
             
             visits.push_back(visit);
-            // std::cerr << "done finding sequences for tag" << endl;
         }
+        g_find_seq_stats.walk_ms += duration<double, std::milli>(
+            high_resolution_clock::now() - _t_walk).count();
+        g_find_seq_stats.walk_steps += (locate_end - locate_start);
 
         // Diagnostics: LF cost of this run = navigation (sample → run start) +
         // run walk (one locateNext per position after the first). The "last
