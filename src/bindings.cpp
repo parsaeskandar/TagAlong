@@ -80,6 +80,27 @@ PYBIND11_MODULE(liftover_ext, m) {
         .def_readwrite("decompress_sa_entries", &AnchorBuildPyResult::decompress_sa_entries)
         .def_readwrite("n_target_subpaths",  &AnchorBuildPyResult::n_target_subpaths)
         .def_readwrite("n_source_mappings",  &AnchorBuildPyResult::n_source_mappings)
+        .def_readwrite("parse_ms",        &AnchorBuildPyResult::parse_ms)
+        .def_readwrite("resolve_ms",      &AnchorBuildPyResult::resolve_ms)
+        .def_readwrite("touched_scan_ms", &AnchorBuildPyResult::touched_scan_ms)
+        .def_readwrite("build_ms",        &AnchorBuildPyResult::build_ms)
+        .def_readwrite("n_touched_subpaths", &AnchorBuildPyResult::n_touched_subpaths)
+        .def_readwrite("verified_nodes",       &AnchorBuildPyResult::verified_nodes)
+        .def_readwrite("fallback_nodes",       &AnchorBuildPyResult::fallback_nodes)
+        .def_readwrite("verified_rlbwt_calls", &AnchorBuildPyResult::verified_rlbwt_calls)
+        .def_readwrite("verified_walk_steps",  &AnchorBuildPyResult::verified_walk_steps)
+        .def_readwrite("verified_walks",       &AnchorBuildPyResult::verified_walks)
+        .def_readwrite("verified_budget_hit",  &AnchorBuildPyResult::verified_budget_hit)
+        .def_readwrite("fs_rank_ms",    &AnchorBuildPyResult::fs_rank_ms)
+        .def_readwrite("fs_select_ms",  &AnchorBuildPyResult::fs_select_ms)
+        .def_readwrite("fs_runspan_ms", &AnchorBuildPyResult::fs_runspan_ms)
+        .def_readwrite("fs_runid_ms",   &AnchorBuildPyResult::fs_runid_ms)
+        .def_readwrite("fs_sample_ms",  &AnchorBuildPyResult::fs_sample_ms)
+        .def_readwrite("fs_nav_ms",     &AnchorBuildPyResult::fs_nav_ms)
+        .def_readwrite("fs_walk_ms",    &AnchorBuildPyResult::fs_walk_ms)
+        .def_readwrite("fs_unpack_ms",  &AnchorBuildPyResult::fs_unpack_ms)
+        .def_readwrite("fs_nav_steps",  &AnchorBuildPyResult::fs_nav_steps)
+        .def_readwrite("fs_walk_steps", &AnchorBuildPyResult::fs_walk_steps)
         .def("__repr__", [](const AnchorBuildPyResult& r) {
             return "<AnchorBuildResult status='" + r.status +
                    "' n_anchors=" + std::to_string(r.anchors.size()) +
@@ -155,6 +176,21 @@ PYBIND11_MODULE(liftover_ext, m) {
         .def_readwrite("intervals",  &TranslationRun::intervals)
         .def_readwrite("timed_out",  &TranslationRun::timed_out)
         .def_readwrite("elapsed_ms", &TranslationRun::elapsed_ms);
+
+    py::class_<AnchorWalkSim>(m, "AnchorWalkSim")
+        .def(py::init<>())
+        .def_readwrite("status",            &AnchorWalkSim::status)
+        .def_readwrite("mapped_nodes",      &AnchorWalkSim::mapped_nodes)
+        .def_readwrite("total_occurrences", &AnchorWalkSim::total_occurrences)
+        .def_readwrite("first_node_occ",    &AnchorWalkSim::first_node_occ)
+        .def_readwrite("nodes_agree",       &AnchorWalkSim::nodes_agree)
+        .def_readwrite("nodes_fallback",    &AnchorWalkSim::nodes_fallback)
+        .def_readwrite("occ_missed",        &AnchorWalkSim::occ_missed)
+        .def_readwrite("capped_agree",      &AnchorWalkSim::capped_agree)
+        .def_readwrite("capped_fallback",   &AnchorWalkSim::capped_fallback)
+        .def_readwrite("walk_span_nodes",   &AnchorWalkSim::walk_span_nodes)
+        .def_readwrite("nodes_agree_increasing", &AnchorWalkSim::nodes_agree_increasing)
+        .def_readwrite("sim_ms",            &AnchorWalkSim::sim_ms);
 
     py::class_<Index>(m, "Index")
         .def(py::init<>())
@@ -252,6 +288,12 @@ PYBIND11_MODULE(liftover_ext, m) {
              py::arg("target_haplotype"),
              "Build surjection anchors from a graph GAF and a target haplotype name. "
              "Returns a list of AnchorRecord (empty if no anchors could be built).")
+        .def("simulate_anchor_walk", &Index::simulate_anchor_walk,
+             py::call_guard<py::gil_scoped_release>(),
+             py::arg("graph_alignment_gaf"), py::arg("target_haplotype"),
+             "Measurement only: would a forward walk from every occurrence of "
+             "the first common node find every target occurrence? Reports how "
+             "many nodes would need the RLBWT fallback. Runs no RLBWT lookups.")
         .def("build_surject_anchors_full", &Index::build_surject_anchors,
              py::call_guard<py::gil_scoped_release>(), py::arg("graph_alignment_gaf"),
              py::arg("target_haplotype"),

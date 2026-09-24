@@ -63,6 +63,22 @@ struct AnchorWalkStats {
     size_t decompress_sa_calls = 0;   ///< number of gbwt FastLocate decompressSA() calls
     size_t decompress_sa_entries = 0; ///< total SA values returned across those calls
     double decompress_sa_ms = 0.0;    ///< wall-clock time in decompressSA()
+
+    // ── walk-verified anchor search (find_anchors_walk_verified) ───────────
+    /// Nodes whose target occurrences the walk found completely (seen ==
+    /// expected), so no RLBWT lookup was needed.
+    size_t verified_nodes = 0;
+    /// Nodes where the walk came up short and the RLBWT fallback ran. Measured
+    /// at 0 across 18 region/target pairs, but the fallback exists because that
+    /// is a measurement, not a proof.
+    size_t fallback_nodes = 0;
+    /// find_sequences_for_tag calls the verified path actually made: 1 for the
+    /// start anchor plus one per fallback node. Compare against
+    /// find_seq_calls under the old path (6,637 on chr8:7.52Mb).
+    size_t verified_rlbwt_calls = 0;
+    size_t verified_walk_steps = 0;   ///< LF steps across all verification walks
+    size_t verified_walks = 0;        ///< walks started (= |F|)
+    bool   verified_budget_hit = false;  ///< a walk stopped on the step budget
 };
 extern thread_local AnchorWalkStats g_anchor_walk_stats;
 
