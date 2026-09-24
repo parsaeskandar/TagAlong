@@ -2323,6 +2323,7 @@ AnchorBuildPyResult Index::build_surject_anchors(
 
     out.touched_scan_ms = ms_since(_t_touched);
     out.n_touched_subpaths = touched.size();
+    // (filled after the build below, from g_anchor_walk_stats)
 
     // Build anchors only for the touched subpaths, keeping the same "pick the
     // result with the most anchors" semantics as before.
@@ -2383,6 +2384,12 @@ AnchorBuildPyResult Index::build_surject_anchors(
     out.fs_unpack_ms  = g_find_seq_stats.unpack_ms;
     out.fs_nav_steps  = g_find_seq_stats.nav_steps;
     out.fs_walk_steps = g_find_seq_stats.walk_steps;
+    out.verified_nodes       = panindexer::g_anchor_walk_stats.verified_nodes;
+    out.fallback_nodes       = panindexer::g_anchor_walk_stats.fallback_nodes;
+    out.verified_rlbwt_calls = panindexer::g_anchor_walk_stats.verified_rlbwt_calls;
+    out.verified_walk_steps  = panindexer::g_anchor_walk_stats.verified_walk_steps;
+    out.verified_walks       = panindexer::g_anchor_walk_stats.verified_walks;
+    out.verified_budget_hit  = panindexer::g_anchor_walk_stats.verified_budget_hit;
     out.find_seq_runs      = g_find_seq_stats.runs;
     out.find_seq_lf_steps  = g_find_seq_stats.lf_steps;
     out.find_seq_visits    = g_find_seq_stats.visits;

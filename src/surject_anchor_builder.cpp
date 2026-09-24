@@ -1,3 +1,4 @@
+#include <set>
 #include "pangenome_index/surject_anchor_builder.hpp"
 
 #include <gbwt/utils.h>
@@ -553,6 +554,176 @@ std::vector<PrecomputedAnchor> find_anchors_all_candidates(
     return anchors;
 }
 
+/// Walk-verified anchor search (DEFAULT).
+///
+/// The all-candidates search below is correct but calls find_sequences_for_tag
+/// once per read node -- 6,637 calls on chr8:7,520,859-7,617,127, 47.7 ms each,
+/// 99.4% of which is navigating the r-index to reach tiny tag runs. That cost is
+/// driven by run FRAGMENTATION, which varies ~200x between regions (2-7 runs per
+/// node in unique sequence, 67-93 in a segdup), so it cannot be tuned away.
+///
+/// This path pays that cost ONCE and derives the rest from a walk:
+///
+///   1. decompressSA per node (~0.12 ms, and already paid as the off-target
+///      gate) gives how many times the target passes each node -- `expected`.
+///   2. One find_sequences_for_tag on the FIRST mapped node the target visits
+///      gives real base offsets to start from; every occurrence is used as a
+///      start, so we never have to guess which copy the read came from.
+///   3. Walking the target forward with gbwt LF accumulates base offsets for
+///      free (summing node lengths), recording each mapped node it passes.
+///   4. A node whose walk hits equal `expected` is fully resolved -- emit all of
+///      them, which preserves the all-candidates guarantee that the Surjector
+///      sees every copy. A node that comes up short falls back to the RLBWT.
+///
+/// The count check is what makes this safe: it detects the old walk path's
+/// failure mode (FIFO pairing silently collapsing a node to one occurrence)
+/// instead of assuming it away. Measured fallback rate across 7 regions x 3
+/// targets (including the two worst segdups, chr8 defensin and chr17 17q12):
+/// 0 of 18. Set PANGENOME_SURJECT_ALL_CANDIDATES=1 to use the old path.
+std::vector<PrecomputedAnchor> find_anchors_walk_verified(
+    const gbwtgraph::GBZ& gbz,
+    FastLocate& rlbwt_rindex,
+    SampledTagArray& sampled,
+    const gbwt::FastLocate& gbwt_fast_locate,
+    const std::vector<SourceMapping>& mappings,
+    size_t target_seq_id_fwd) {
+
+    // ── 1. expected[node]: target passes per node, from the GBWT only ───────
+    std::unordered_map<gbwt::node_type, size_t> expected;
+    auto source_visits = build_source_visits(mappings);   // node -> mapping indices
+    expected.reserve(source_visits.size());
+    for (const auto& kv : source_visits) {
+        const gbwt::node_type node = kv.first;
+        const auto _ds = std::chrono::high_resolution_clock::now();
+        std::vector<gbwt::size_type> sa = gbwt_fast_locate.decompressSA(node);
+        g_anchor_walk_stats.decompress_sa_ms +=
+            std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - _ds).count();
+        g_anchor_walk_stats.decompress_sa_calls++;
+        g_anchor_walk_stats.decompress_sa_entries += sa.size();
+        size_t c = 0;
+        for (gbwt::size_type v : sa)
+            if (static_cast<size_t>(gbwt_fast_locate.seqId(v)) == target_seq_id_fwd) c++;
+        if (c > 0) expected.emplace(node, c);
+    }
+    if (expected.empty()) return {};
+
+    // ── 2. the first mapped node (read order) the target visits ─────────────
+    size_t first_idx = mappings.size();
+    for (size_t i = 0; i < mappings.size(); ++i) {
+        gbwt::node_type node = gbwt::Node::encode(mappings[i].node_id, mappings[i].is_reverse);
+        if (expected.count(node)) { first_idx = i; break; }
+    }
+    if (first_idx == mappings.size()) return {};
+
+    // ── 3. THE one RLBWT call: real base offsets for that node ──────────────
+    std::vector<std::pair<size_t, gbwt::edge_type>> starts;
+    if (!locate_all_target_visits(rlbwt_rindex, sampled, gbwt_fast_locate,
+                                  mappings[first_idx], target_seq_id_fwd, starts)) {
+        return {};
+    }
+    g_anchor_walk_stats.verified_rlbwt_calls++;
+
+    // ── 4. walk forward from every start, collecting (base, edge) per node ──
+    // Budget is a safety valve, not the stop condition: the walk normally exits
+    // as soon as every expected occurrence is accounted for. Sized well above
+    // the largest span measured (29,431 nodes on chr17 for ~5,000 read nodes),
+    // because the target can carry far more nodes across the read's span than
+    // the read itself does.
+    static const size_t walk_budget = []() -> size_t {
+        const char* e = std::getenv("PANGENOME_SURJECT_WALK_CAP");
+        if (e) { long v = std::atol(e); if (v > 0) return static_cast<size_t>(v); }
+        return 500000;
+    }();
+
+    // node -> unique (base, edge) pairs the walk found
+    std::unordered_map<gbwt::node_type,
+                       std::vector<std::pair<size_t, gbwt::edge_type>>> hits;
+    std::unordered_map<gbwt::node_type, std::set<size_t>> hit_bases;   // dedup
+    size_t satisfied = 0;
+
+    auto record = [&](gbwt::node_type node, size_t base, const gbwt::edge_type& edge) {
+        auto ex = expected.find(node);
+        if (ex == expected.end()) return;
+        auto& seen_set = hit_bases[node];
+        if (!seen_set.insert(base).second) return;          // already have it
+        hits[node].emplace_back(base, edge);
+        if (seen_set.size() == ex->second) satisfied++;      // this node is done
+    };
+
+    for (const auto& st : starts) {
+        if (satisfied == expected.size()) break;
+        gbwt::edge_type cursor = st.second;
+        size_t base = st.first;
+        g_anchor_walk_stats.verified_walks++;
+        record(cursor.first, base, cursor);
+        size_t steps = 0;
+        while (satisfied < expected.size() && steps < walk_budget) {
+            handlegraph::handle_t h = gbz.graph.get_handle(
+                gbwt::Node::id(cursor.first), gbwt::Node::is_reverse(cursor.first));
+            const size_t node_len = gbz.graph.get_length(h);
+            gbwt::edge_type next = gbz.index.LF(cursor);
+            g_anchor_walk_stats.verified_walk_steps++;
+            steps++;
+            if (next.first == gbwt::ENDMARKER) break;
+            cursor = next;
+            base += node_len;
+            record(cursor.first, base, cursor);
+        }
+        if (steps >= walk_budget) g_anchor_walk_stats.verified_budget_hit = true;
+    }
+
+    // ── 5. verify per node; only shortfalls pay the RLBWT ───────────────────
+    std::vector<PrecomputedAnchor> anchors;
+    std::vector<std::pair<size_t, gbwt::edge_type>> fb;
+    for (size_t i = 0; i < mappings.size(); ++i) {
+        gbwt::node_type node = gbwt::Node::encode(mappings[i].node_id, mappings[i].is_reverse);
+        auto ex = expected.find(node);
+        if (ex == expected.end()) continue;               // off-target node
+
+        const std::vector<std::pair<size_t, gbwt::edge_type>>* visits = nullptr;
+        auto h = hits.find(node);
+        if (h != hits.end() && h->second.size() == ex->second) {
+            visits = &h->second;                          // walk resolved it
+        } else {
+            fb.clear();
+            if (!locate_all_target_visits(rlbwt_rindex, sampled, gbwt_fast_locate,
+                                          mappings[i], target_seq_id_fwd, fb)) continue;
+            g_anchor_walk_stats.verified_rlbwt_calls++;
+            visits = &fb;
+        }
+        for (const auto& v : *visits) {
+            PrecomputedAnchor a;
+            a.source_mapping_begin = i;
+            a.source_mapping_end   = i + 1;
+            a.read_begin_offset = mappings[i].read_begin_offset;
+            a.read_end_offset   = mappings[i].read_end_offset;
+            a.path_offset_step_begin = v.first;
+            a.path_offset_step_end   = v.first;
+            a.gbwt_edge_begin = v.second;
+            a.gbwt_edge_end   = v.second;
+            a.step_begin = edge_to_step_handle(v.second);
+            a.step_end   = edge_to_step_handle(v.second);
+            anchors.push_back(a);
+        }
+    }
+    // per-NODE accounting (not per mapping), so the ratio is comparable to the
+    // simulation that justified this path
+    for (const auto& kv : expected) {
+        auto h = hits.find(kv.first);
+        if (h != hits.end() && h->second.size() == kv.second) g_anchor_walk_stats.verified_nodes++;
+        else                                                  g_anchor_walk_stats.fallback_nodes++;
+    }
+
+    std::sort(anchors.begin(), anchors.end(),
+              [](const PrecomputedAnchor& a, const PrecomputedAnchor& b) {
+                  if (a.read_begin_offset != b.read_begin_offset)
+                      return a.read_begin_offset < b.read_begin_offset;
+                  return a.path_offset_step_begin < b.path_offset_step_begin;
+              });
+    return anchors;
+}
+
 /// Core anchor search for ONE strand. `mappings` are oriented so each node
 /// matches the target path's forward-strand traversal (the read's own mappings
 /// for a forward-strand read; make_reverse_strand_mappings()'s output for a
@@ -579,14 +750,29 @@ std::vector<PrecomputedAnchor> find_anchors_for_strand(
     const gbwt::FastLocate& gbwt_fast_locate,
     const std::vector<SourceMapping>& mappings,
     size_t target_seq_id_fwd) {
+    // Three paths, newest first:
+    //   default                            walk-verified (one RLBWT call + a
+    //                                       GBWT walk, verified by GBWT counts)
+    //   PANGENOME_SURJECT_ALL_CANDIDATES=1  the previous default: one RLBWT
+    //                                       call per read node. Correct but
+    //                                       ~300x slower in segdups.
+    //   PANGENOME_SURJECT_ANCHOR_WALK=1     the legacy single-occurrence walk,
+    //                                       kept only for A/B; it has the two
+    //                                       documented repeat failure modes.
     static const bool use_walk =
         (std::getenv("PANGENOME_SURJECT_ANCHOR_WALK") != nullptr);
+    static const bool use_all =
+        (std::getenv("PANGENOME_SURJECT_ALL_CANDIDATES") != nullptr);
     if (use_walk) {
         return find_anchors_walk(gbz, rlbwt_rindex, sampled, gbwt_fast_locate,
                                  mappings, target_seq_id_fwd);
     }
-    return find_anchors_all_candidates(rlbwt_rindex, sampled, gbwt_fast_locate,
-                                       mappings, target_seq_id_fwd);
+    if (use_all) {
+        return find_anchors_all_candidates(rlbwt_rindex, sampled, gbwt_fast_locate,
+                                           mappings, target_seq_id_fwd);
+    }
+    return find_anchors_walk_verified(gbz, rlbwt_rindex, sampled, gbwt_fast_locate,
+                                      mappings, target_seq_id_fwd);
 }
 
 /// Legacy single-occurrence + LF-walk search (see find_anchors_for_strand).

@@ -230,6 +230,14 @@ struct AnchorBuildPyResult {
     double build_ms = 0.0;         ///< the per-subpath anchor build itself
     uint64_t n_touched_subpaths = 0;
 
+    /// walk-verified anchor search accounting
+    uint64_t verified_nodes = 0;        ///< nodes resolved by the walk alone
+    uint64_t fallback_nodes = 0;        ///< nodes that still needed the RLBWT
+    uint64_t verified_rlbwt_calls = 0;  ///< find_sequences_for_tag calls made
+    uint64_t verified_walk_steps = 0;   ///< GBWT LF steps across the walks
+    uint64_t verified_walks = 0;
+    bool     verified_budget_hit = false;
+
     /// find_sequences_for_tag internal breakdown (see FindSeqStats).
     double fs_rank_ms = 0.0, fs_select_ms = 0.0, fs_runspan_ms = 0.0;
     double fs_runid_ms = 0.0, fs_sample_ms = 0.0;
