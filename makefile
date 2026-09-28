@@ -102,7 +102,7 @@ LIBRARY = $(BUILD_LIB)/libpanindexer.a
 PROGRAMS = $(addprefix $(BUILD_BIN)/,build_tags merge_tags build_rindex query_tags tags_check find_mems convert_tags print_stats build_sampled_tags query_sampled_tags coordinate_translation build_translation_tables measure_table2_size build_table2_coarse validate_table2)
 
 # Targets
-.PHONY: all clean directories grlbwt gbwtgraph-lib test
+.PHONY: all clean directories grlbwt gbwtgraph-lib test seqt
 
 all: grlbwt directories $(LIBRARY) $(PROGRAMS)
 
@@ -170,6 +170,45 @@ liftover_ext.so: liftover_ext$(PYTHON_EXT_SUFFIX)
 	@if [ "liftover_ext$(PYTHON_EXT_SUFFIX)" != "liftover_ext.so" ]; then \
 		ln -sf liftover_ext$(PYTHON_EXT_SUFFIX) liftover_ext.so; \
 	fi
+
+# ── SequenceLocate-only tools ──────────────────────────────────────────────
+# These link a DIFFERENT gbwt (the one providing SequenceLocate) plus vg's
+# sdsl / gbwtgraph / handlegraph. Kept out of liftover_ext.so on purpose: two
+# gbwt versions in one binary would be an ODR violation, so each is a
+# standalone binary. Override the two paths on the command line to build
+# elsewhere, e.g. make SEQT_GBWT=/path/to/gbwt bin/sri_anchors
+SEQT_VG   ?= /private/groups/cgl/seeskand/1.server/Giraffe_server
+SEQT_GBWT ?= /private/groups/cgl/seeskand/2.gbwt_translation/gbwt
+SEQT_CXXFLAGS = -std=c++17 -O3 -march=native -fopenmp -pthread \
+  -I$(SEQT_GBWT)/include -I$(SEQT_VG)/include
+SEQT_LIBS = $(SEQT_VG)/lib/libgbwtgraph.a $(SEQT_GBWT)/lib/libgbwt.a \
+  $(SEQT_VG)/lib/libhandlegraph.a $(SEQT_VG)/lib/libsdsl.a -lzstd -lcrypto
+
+SEQT_PROGRAMS = bin/sequence_translate bin/sequence_translate_batch \
+  bin/sequence_translate_bench bin/sri_build bin/sri_anchors
+
+seqt: $(SEQT_PROGRAMS)
+
+bin/sequence_translate: src/sequence_translate_main.cpp src/sequence_translation.cpp
+	@mkdir -p bin
+	$(CXX) $(SEQT_CXXFLAGS) -o $@ src/sequence_translate_main.cpp $(SEQT_LIBS)
+
+bin/sequence_translate_batch: src/sequence_translate_batch.cpp src/sequence_translation.cpp
+	@mkdir -p bin
+	$(CXX) $(SEQT_CXXFLAGS) -o $@ src/sequence_translate_batch.cpp $(SEQT_LIBS)
+
+bin/sequence_translate_bench: src/sequence_translate_bench.cpp src/sequence_translation.cpp
+	@mkdir -p bin
+	$(CXX) $(SEQT_CXXFLAGS) -o $@ src/sequence_translate_bench.cpp $(SEQT_LIBS)
+
+bin/sri_build: src/sri_build.cpp
+	@mkdir -p bin
+	$(CXX) $(SEQT_CXXFLAGS) -o $@ src/sri_build.cpp $(SEQT_LIBS)
+
+bin/sri_anchors: src/sri_anchor_main.cpp src/sri_anchor_builder.cpp
+	@mkdir -p bin
+	$(CXX) $(SEQT_CXXFLAGS) -o $@ src/sri_anchor_main.cpp $(SEQT_LIBS)
+
 
 clean:
 	rm -rf $(BUILD_BIN) $(BUILD_LIB) $(BUILD_OBJ)

@@ -294,6 +294,9 @@ PYBIND11_MODULE(liftover_ext, m) {
              "Measurement only: would a forward walk from every occurrence of "
              "the first common node find every target occurrence? Reports how "
              "many nodes would need the RLBWT fallback. Runs no RLBWT lookups.")
+        .def("source_mappings_for_gaf", &Index::source_mappings_for_gaf,
+             py::call_guard<py::gil_scoped_release>(), py::arg("graph_alignment_gaf"),
+             "Parsed source mappings as (node_id, is_reverse, read_begin, read_end).")
         .def("build_surject_anchors_full", &Index::build_surject_anchors,
              py::call_guard<py::gil_scoped_release>(), py::arg("graph_alignment_gaf"),
              py::arg("target_haplotype"),

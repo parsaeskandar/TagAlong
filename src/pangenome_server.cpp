@@ -2199,6 +2199,21 @@ AnchorWalkSim Index::simulate_anchor_walk(
     return out;
 }
 
+/// Export a GAF's parsed source mappings so an out-of-process builder gets the
+/// identical input.
+std::vector<std::tuple<int64_t, bool, size_t, size_t>>
+Index::source_mappings_for_gaf(const std::string& gaf_str) const {
+    if (!loaded_) {
+        throw std::runtime_error("Index::source_mappings_for_gaf called before load()");
+    }
+    std::vector<std::tuple<int64_t, bool, size_t, size_t>> out;
+    for (const auto& m : gaf_to_source_mappings(gaf_str, gbz_->graph)) {
+        out.emplace_back(m.node_id, m.is_reverse,
+                         m.read_begin_offset, m.read_end_offset);
+    }
+    return out;
+}
+
 AnchorBuildPyResult Index::build_surject_anchors(
     const std::string& gaf_str,
     const std::string& target_haplotype) const

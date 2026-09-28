@@ -394,6 +394,12 @@ public:
     AnchorWalkSim simulate_anchor_walk(const std::string& gaf_str,
                                        const std::string& target_haplotype) const;
 
+    /// Export a GAF's parsed source mappings as (node_id, is_reverse,
+    /// read_begin, read_end), so an out-of-process builder can be fed the
+    /// identical input this Index would use.
+    std::vector<std::tuple<int64_t, bool, size_t, size_t>>
+    source_mappings_for_gaf(const std::string& gaf_str) const;
+
 private:
     bool loaded_ = false;
 
