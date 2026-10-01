@@ -1088,6 +1088,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--dist"); p.add_argument("--zipcodes", help="LONG-READ zipcodes")
     p.add_argument("--ri"); p.add_argument("--tags"); p.add_argument("--gbwt-ri")
     p.add_argument("--t1")
+    p.add_argument("--sri", default="",
+                   help="SequenceLocate index. When given, translation and "
+                        "surjection anchors run on it and --ri/--tags/"
+                        "--gbwt-ri/--t1/--t2 are not needed.")
     p.add_argument("--t2", default="",
                    help="Translation Table 2 (OPTIONAL). Omit to run table-free: "
                         "translation then uses only Table 1 + the GBWT/tag array.")
@@ -1140,7 +1144,9 @@ def main() -> int:
         # selects the table-free translation path. Keeping it here made the
         # process exit before binding the port, so the proxy answered with its
         # own 503 instead of our JSON one.
-        required = ("vg", "gbz", "minimizer", "dist", "zipcodes", "ri", "tags", "gbwt_ri", "t1")
+        required = ["vg", "gbz", "minimizer", "dist", "zipcodes"]
+        if not args.sri:
+            required += ["ri", "tags", "gbwt_ri", "t1"]
         missing = [f for f in required if not getattr(args, f)]
         if missing:
             print("ERROR: missing required args (or pass --stub): "
@@ -1152,7 +1158,7 @@ def main() -> int:
             mw = PangenomeMiddleware.from_paths(
                 vg_binary=args.vg, gbz=args.gbz, minimizer=args.minimizer,
                 distance=args.dist, zipcodes=args.zipcodes, ri=args.ri, tags=args.tags,
-                gbwt_ri=args.gbwt_ri, t1=args.t1, t2=args.t2,
+                gbwt_ri=args.gbwt_ri, t1=args.t1, t2=args.t2, sri=args.sri,
                 threads=args.threads, max_multimaps=args.max_multimaps,
                 output_timeout_s=args.job_timeout,
             )
