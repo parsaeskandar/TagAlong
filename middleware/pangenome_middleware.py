@@ -277,14 +277,16 @@ class PangenomeMiddleware:
         engine's BLAT default of 100. No `--surject-target` is pre-indexed: the
         anchor pipeline surjects onto any haplotype at query time.
         """
+        # Coerce None -> "": callers that build these from argparse pass None
+        # for an omitted path, and the extension's load() takes str.
         coord_paths = CoordinateIndexPaths(
             gbz_path=gbz,
-            ri_path=ri,
-            tags_path=tags,
-            gbwt_ri_path=gbwt_ri,
-            table1_path=t1,
-            table2_path=t2,
-            sri_path=sri,
+            ri_path=ri or "",
+            tags_path=tags or "",
+            gbwt_ri_path=gbwt_ri or "",
+            table1_path=t1 or "",
+            table2_path=t2 or "",
+            sri_path=sri or "",
         )
         giraffe_cfg = GiraffeServerConfig(
             vg_binary=vg_binary,

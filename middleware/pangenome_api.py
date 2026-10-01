@@ -1086,8 +1086,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--vg"); p.add_argument("--gbz")
     p.add_argument("--minimizer", help="LONG-READ minimizer index")
     p.add_argument("--dist"); p.add_argument("--zipcodes", help="LONG-READ zipcodes")
-    p.add_argument("--ri"); p.add_argument("--tags"); p.add_argument("--gbwt-ri")
-    p.add_argument("--t1")
+    # default="" not None: these are optional with --sri, and the extension's
+    # load() takes str, so None would fail the pybind11 conversion.
+    p.add_argument("--ri", default=""); p.add_argument("--tags", default="")
+    p.add_argument("--gbwt-ri", default="")
+    p.add_argument("--t1", default="")
     p.add_argument("--sri", default="",
                    help="SequenceLocate index. When given, translation and "
                         "surjection anchors run on it and --ri/--tags/"
