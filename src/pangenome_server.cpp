@@ -657,6 +657,18 @@ Index::translatable_haplotypes_scored(const std::string& src_haplotype,
                                       int64_t start, int64_t end,
                                       double min_coverage,
                                       size_t max_nodes) const {
+    static const bool no_sri_env = (std::getenv("PANGENOME_NO_SRI") != nullptr);
+    if (have_sri_ && !no_sri_env) {
+        return translatable_haplotypes_scored_sri(src_haplotype, start, end,
+                                                  min_coverage, max_nodes);
+    }
+    // No Table 2 here: this is the table-free counterpart, which walks the
+    // source's nodes and asks the tag array who shares them.
+    if (!gbwt_rindex_ || rlbwt_rindex_.size() == 0) {
+        throw std::runtime_error(
+            "Index::translatable_haplotypes_scored needs table1_path, ri_path, "
+            "tags_path and gbwt_ri_path; they are not loaded");
+    }
     if (!loaded_)
         throw std::runtime_error("Index::translatable_haplotypes_scored called before load()");
     if (end - start > MAX_INTERVAL_LENGTH)
@@ -794,6 +806,12 @@ Index::translate_no_table2(const std::string& src_haplotype,
     constexpr size_t MAX_FRAGMENT_DETAIL = 500;
     if (!loaded_)
         throw std::runtime_error("Index::translate_no_table2 called before load()");
+    if (!gbwt_rindex_) {
+        throw std::runtime_error(
+            "Index::translate_no_table2 is the tag-array path and needs "
+            "ri_path/tags_path/gbwt_ri_path; they are not loaded. With an .sri "
+            "loaded, call translate() instead.");
+    }
     if (end - start > MAX_INTERVAL_LENGTH)
         throw std::invalid_argument(
             "Interval length " + std::to_string(end - start) +
@@ -1635,6 +1653,13 @@ Index::translate(const std::string& src_haplotype,
 std::vector<std::string>
 Index::translatable_haplotypes(const std::string& src_haplotype,
                                int64_t start, int64_t end) const {
+    // Table-2 overlap query: needs T1/T2 and the tag-array indexes, which an
+    // .sri-only load does not bring. Fail clearly rather than dereference null.
+    if (!gbwt_rindex_ || !has_table2_) {
+        throw std::runtime_error(
+            "Index::translatable_haplotypes needs table1_path/table2_path and "
+            "gbwt_ri_path; they are not loaded (an .sri does not replace them)");
+    }
     if (!loaded_)
         throw std::runtime_error("Index::translatable_haplotypes called before load()");
 
@@ -2052,6 +2077,26 @@ Index::haplotype_coverage(const std::string& gaf_str, double min_coverage,
     std::unordered_set<std::string> here;
     uint64_t total_bp = 0;
 
+    // Who visits a node: the .sri when loaded, else the GBWT FastLocate. Only
+    // the sequence id is read, which both pack identically; the offsets differ
+    // (bp vs nodes), so decompressSA and seqId must come from the SAME index.
+    if (!have_sri_ && !gbwt_rindex_) {
+        throw std::runtime_error(
+            "Index::haplotype_coverage needs either a .sri (sri_path) or the "
+            "GBWT FastLocate (gbwt_ri_path); neither is loaded");
+    }
+    std::vector<size_t> node_pids;
+    auto pids_at_node = [&](gbwt::node_type node) {
+        node_pids.clear();
+        if (have_sri_) {
+            for (gbwt::size_type v : sri_->decompressSA(node))
+                node_pids.push_back(static_cast<size_t>(sri_->seqId(v)) / 2);
+        } else {
+            for (gbwt::size_type v : gbwt_rindex_->decompressSA(node))
+                node_pids.push_back(static_cast<size_t>(gbwt_rindex_->seqId(v)) / 2);
+        }
+    };
+
     for (const panindexer::SourceMapping& m : mappings) {
         const uint64_t bp = (m.read_end_offset > m.read_begin_offset)
                             ? (m.read_end_offset - m.read_begin_offset) : 0;
@@ -2066,9 +2111,8 @@ Index::haplotype_coverage(const std::string& gaf_str, double min_coverage,
         for (int flip = 0; flip < 2; ++flip) {
             const bool is_rev = (flip == 0) ? m.is_reverse : !m.is_reverse;
             gbwt::node_type node = gbwt::Node::encode(m.node_id, is_rev);
-            std::vector<gbwt::size_type> sa = gbwt_rindex_->decompressSA(node);
-            for (gbwt::size_type v : sa) {
-                const size_t pid = static_cast<size_t>(gbwt_rindex_->seqId(v)) / 2;
+            pids_at_node(node);
+            for (const size_t pid : node_pids) {
                 auto it = pid_to_hap.find(pid);
                 if (it == pid_to_hap.end()) {
                     std::string name;
@@ -2138,6 +2182,11 @@ AnchorWalkSim Index::simulate_anchor_walk(
     const std::string& gaf_str,
     const std::string& target_haplotype) const
 {
+    if (!gbwt_rindex_) {
+        throw std::runtime_error(
+            "Index::simulate_anchor_walk is a measurement of the tag-array "
+            "builder and needs gbwt_ri_path; it is not loaded");
+    }
     AnchorWalkSim out;
     if (!loaded_) throw std::runtime_error("simulate_anchor_walk before load()");
     const auto t0 = prof_clock::now();
@@ -2250,6 +2299,112 @@ AnchorWalkSim Index::simulate_anchor_walk(
 
 
 // ── SequenceLocate backends ────────────────────────────────────────────────
+
+
+/// translatable_haplotypes_scored() on the .sri.
+///
+/// Same scoring as the tag-array version: each node the source visits in the
+/// interval contributes its own length, every haplotype visiting that node is
+/// credited those bases, and coverage is the credit over the total. The source
+/// node walk replaces Table 1 + find_tags_in_interval, and decompressSA
+/// replaces find_sequences_for_tag.
+std::vector<HaplotypeCoverage>
+Index::translatable_haplotypes_scored_sri(const std::string& src_haplotype,
+                                         int64_t start, int64_t end,
+                                         double min_coverage,
+                                         size_t max_nodes) const {
+    std::vector<HaplotypeCoverage> out;
+    if (start < 0 || end < 0 || start > end) {
+        throw std::invalid_argument("Invalid interval [" +
+            std::to_string(start) + ", " + std::to_string(end) + "]");
+    }
+    if (end - start > MAX_INTERVAL_LENGTH) {
+        throw std::invalid_argument(
+            "Interval length " + std::to_string(end - start) +
+            " exceeds maximum of " + std::to_string(MAX_INTERVAL_LENGTH) + " bases");
+    }
+
+    seqtrans::Translator tr(*gbz_, *sri_);
+    seqtrans::Stats st;
+    std::vector<gbwt::node_type> nodes = tr.source_nodes(
+        src_haplotype, static_cast<size_t>(start), static_cast<size_t>(end), st);
+    if (nodes.empty()) {
+        // Throw only when the NAME is unknown. A valid contig whose path simply
+        // has no fragment over this interval (a centromere gap, say) returns an
+        // empty list, which is what the tag-array path does.
+        if (tr.resolve(src_haplotype).empty()) {
+            throw std::invalid_argument(
+                "No paths found for source haplotype: " + src_haplotype);
+        }
+        return out;
+    }
+
+    // Subsampling trades precision for speed on wide intervals, exactly as the
+    // tag-array path does; a sampled node stands for its whole stride.
+    size_t stride = 1;
+    if (max_nodes > 0 && nodes.size() > max_nodes) {
+        stride = (nodes.size() + max_nodes - 1) / max_nodes;
+    }
+
+    const gbwt::GBWT& gbwt_index = gbz_->index;
+    const gbwtgraph::GBWTGraph& graph = gbz_->graph;
+    const bool have_meta = gbwt_index.hasMetadata() &&
+                           gbwt_index.metadata.hasPathNames() &&
+                           gbwt_index.metadata.hasSampleNames();
+
+    std::unordered_map<size_t, std::string> pid_to_hap;
+    std::unordered_map<std::string, uint64_t> covered;
+    std::unordered_set<std::string> here;
+    uint64_t total_bp = 0;
+
+    for (size_t i = 0; i < nodes.size(); i += stride) {
+        const gbwt::node_type node = nodes[i];
+        const uint64_t node_bp = static_cast<uint64_t>(
+            graph.get_length(gbwtgraph::GBWTGraph::node_to_handle(node)));
+        if (node_bp == 0) continue;
+        const uint64_t bp = node_bp * stride;
+        total_bp += bp;
+
+        here.clear();
+        for (gbwt::size_type v : sri_->decompressSA(node)) {
+            const size_t pid = static_cast<size_t>(sri_->seqId(v)) / 2;
+            auto it = pid_to_hap.find(pid);
+            if (it == pid_to_hap.end()) {
+                std::string hn;
+                if (have_meta && pid < gbwt_index.metadata.paths()) {
+                    gbwt::PathName pn = gbwt_index.metadata.path(pid);
+                    hn = gbwt_index.metadata.sample(pn.sample) + "#" +
+                         std::to_string(pn.phase);
+                } else {
+                    hn = "path_" + std::to_string(pid);
+                }
+                it = pid_to_hap.emplace(pid, std::move(hn)).first;
+            }
+            here.insert(it->second);
+        }
+        for (const std::string& h : here) covered[h] += bp;
+    }
+
+    if (total_bp == 0) return out;
+    out.reserve(covered.size());
+    for (const auto& kv : covered) {
+        double pct = 100.0 * static_cast<double>(kv.second) /
+                             static_cast<double>(total_bp);
+        if (pct > 100.0) pct = 100.0;        // stride rounding
+        if (pct < min_coverage) continue;
+        HaplotypeCoverage hc;
+        hc.haplotype = kv.first;
+        hc.covered_bp = kv.second;
+        hc.coverage = pct;
+        out.push_back(std::move(hc));
+    }
+    std::sort(out.begin(), out.end(),
+              [](const HaplotypeCoverage& a, const HaplotypeCoverage& b) {
+                  if (a.covered_bp != b.covered_bp) return a.covered_bp > b.covered_bp;
+                  return a.haplotype < b.haplotype;
+              });
+    return out;
+}
 
 /// translate() on the .sri. Emits the same per-base correspondences the old
 /// path does: one record per covered base, .start = source offset,
@@ -2379,6 +2534,11 @@ AnchorBuildPyResult Index::build_surject_anchors(
     static const bool no_sri_env = (std::getenv("PANGENOME_NO_SRI") != nullptr);
     if (have_sri_ && !no_sri_env) {
         return build_surject_anchors_sri(gaf_str, target_haplotype);
+    }
+
+    if (!gbwt_rindex_) {
+        out.status = "no_tag_array";
+        return out;
     }
 
     const auto _t_parse = prof_clock::now();
