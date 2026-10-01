@@ -13,8 +13,15 @@ MY_CXX ?= g++
 
 # Initial flags
 CXX_FLAGS += $(MY_CXX_FLAGS) $(PARALLEL_FLAGS) $(MY_CXX_OPT_FLAGS)
-# gbwtgraph headers must precede $(INC_DIR): older system installs lack GBZ v2 support.
+# Include order matters twice over:
+#   $(GBWT_DIR)/include must precede everything, because several trees on disk
+#     ship a <gbwt/...> and only one of them has sequence_locate.h;
+#   $(GBWTGRAPH_DIR)/include must precede $(INC_DIR), because older system
+#     installs lack GBZ v2 support.
 GBWTGRAPH_DIR ?= Giraffe_server/deps/gbwtgraph
+ifneq ($(strip $(GBWT_DIR)),)
+CXX_FLAGS += -I$(GBWT_DIR)/include
+endif
 CXX_FLAGS += -Iinclude -I$(GBWTGRAPH_DIR)/include -I$(INC_DIR) -Ideps/vg -Ideps/grlBWT/include -UNDEBUG
 
 # Link vendored libgbwtgraph.a when built (make gbwtgraph-lib); else system -lgbwtgraph from $(LIB_DIR).
@@ -31,7 +38,9 @@ endif
 # produced by a different GBWT version than the one in $(LIB_DIR).
 GBWT_DIR ?=
 ifneq ($(strip $(GBWT_DIR)),)
-GBWT_LIB := $(GBWT_DIR)/lib/libgbwt.a
+# Prefer a PIC build when present: liftover_ext.so is a shared object, and a
+# non-PIC archive cannot be linked into one.
+GBWT_LIB := $(firstword $(wildcard $(GBWT_DIR)/lib-pic/libgbwt.a $(GBWT_DIR)/lib/libgbwt.a))
 ifeq ($(wildcard $(GBWT_LIB)),)
 GBWT_LIBS = -L$(GBWT_DIR)/lib -lgbwt
 $(info gbwt: linking -lgbwt from $(GBWT_DIR)/lib (no libgbwt.a found, using shared))
@@ -39,7 +48,6 @@ else
 GBWT_LIBS = $(GBWT_LIB)
 $(info gbwt: linking vendored $(GBWT_LIB))
 endif
-CXX_FLAGS += -I$(GBWT_DIR)/include
 else
 GBWT_LIBS = -lgbwt
 endif
