@@ -197,14 +197,20 @@ PYBIND11_MODULE(liftover_ext, m) {
         .def("load", &Index::load,
              py::call_guard<py::gil_scoped_release>(),
              py::arg("gbz_path"),
-             py::arg("ri_path"),
-             py::arg("tags_path"),
-             py::arg("gbwt_ri_path"),
-             py::arg("table1_path"),
+             py::arg("ri_path") = "",
+             py::arg("tags_path") = "",
+             py::arg("gbwt_ri_path") = "",
+             py::arg("table1_path") = "",
              py::arg("table2_path") = "",
-             "Load all index files into memory (call once at startup). "
-             "table2_path may be omitted/empty: translation then uses the "
-             "table-free path, which needs only Table 1 plus the GBWT/tag array.")
+             py::arg("sri_path") = "",
+             "Load index files into memory (call once at startup). Only "
+             "gbz_path is required. Pass sri_path to run translation and "
+             "surjection anchors on the SequenceLocate backend, in which case "
+             "ri_path/tags_path/gbwt_ri_path/table1_path may all be omitted "
+             "(~110 GB of index that is then unnecessary). Supplying the old "
+             "paths and no sri_path keeps the previous behaviour exactly.")
+        .def("has_sri", &Index::has_sri,
+             "True when a .sri is loaded and in use for translate/anchors.")
         .def("has_table2", &Index::has_table2,
              "True if a Table 2 was loaded.")
         .def("translatable_haplotypes_scored", &Index::translatable_haplotypes_scored,
@@ -294,6 +300,9 @@ PYBIND11_MODULE(liftover_ext, m) {
              "Measurement only: would a forward walk from every occurrence of "
              "the first common node find every target occurrence? Reports how "
              "many nodes would need the RLBWT fallback. Runs no RLBWT lookups.")
+        .def("source_mappings_for_gaf", &Index::source_mappings_for_gaf,
+             py::call_guard<py::gil_scoped_release>(), py::arg("graph_alignment_gaf"),
+             "Parsed source mappings as (node_id, is_reverse, read_begin, read_end).")
         .def("build_surject_anchors_full", &Index::build_surject_anchors,
              py::call_guard<py::gil_scoped_release>(), py::arg("graph_alignment_gaf"),
              py::arg("target_haplotype"),

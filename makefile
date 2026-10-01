@@ -13,8 +13,15 @@ MY_CXX ?= g++
 
 # Initial flags
 CXX_FLAGS += $(MY_CXX_FLAGS) $(PARALLEL_FLAGS) $(MY_CXX_OPT_FLAGS)
-# gbwtgraph headers must precede $(INC_DIR): older system installs lack GBZ v2 support.
+# Include order matters twice over:
+#   $(GBWT_DIR)/include must precede everything, because several trees on disk
+#     ship a <gbwt/...> and only one of them has sequence_locate.h;
+#   $(GBWTGRAPH_DIR)/include must precede $(INC_DIR), because older system
+#     installs lack GBZ v2 support.
 GBWTGRAPH_DIR ?= Giraffe_server/deps/gbwtgraph
+ifneq ($(strip $(GBWT_DIR)),)
+CXX_FLAGS += -I$(GBWT_DIR)/include
+endif
 CXX_FLAGS += -Iinclude -I$(GBWTGRAPH_DIR)/include -I$(INC_DIR) -Ideps/vg -Ideps/grlBWT/include -UNDEBUG
 
 # Link vendored libgbwtgraph.a when built (make gbwtgraph-lib); else system -lgbwtgraph from $(LIB_DIR).
@@ -31,7 +38,9 @@ endif
 # produced by a different GBWT version than the one in $(LIB_DIR).
 GBWT_DIR ?=
 ifneq ($(strip $(GBWT_DIR)),)
-GBWT_LIB := $(GBWT_DIR)/lib/libgbwt.a
+# Prefer a PIC build when present: liftover_ext.so is a shared object, and a
+# non-PIC archive cannot be linked into one.
+GBWT_LIB := $(firstword $(wildcard $(GBWT_DIR)/lib-pic/libgbwt.a $(GBWT_DIR)/lib/libgbwt.a))
 ifeq ($(wildcard $(GBWT_LIB)),)
 GBWT_LIBS = -L$(GBWT_DIR)/lib -lgbwt
 $(info gbwt: linking -lgbwt from $(GBWT_DIR)/lib (no libgbwt.a found, using shared))
@@ -39,7 +48,6 @@ else
 GBWT_LIBS = $(GBWT_LIB)
 $(info gbwt: linking vendored $(GBWT_LIB))
 endif
-CXX_FLAGS += -I$(GBWT_DIR)/include
 else
 GBWT_LIBS = -lgbwt
 endif
@@ -102,7 +110,7 @@ LIBRARY = $(BUILD_LIB)/libpanindexer.a
 PROGRAMS = $(addprefix $(BUILD_BIN)/,build_tags merge_tags build_rindex query_tags tags_check find_mems convert_tags print_stats build_sampled_tags query_sampled_tags coordinate_translation build_translation_tables measure_table2_size build_table2_coarse validate_table2)
 
 # Targets
-.PHONY: all clean directories grlbwt gbwtgraph-lib test
+.PHONY: all clean directories grlbwt gbwtgraph-lib test seqt
 
 all: grlbwt directories $(LIBRARY) $(PROGRAMS)
 
@@ -170,6 +178,45 @@ liftover_ext.so: liftover_ext$(PYTHON_EXT_SUFFIX)
 	@if [ "liftover_ext$(PYTHON_EXT_SUFFIX)" != "liftover_ext.so" ]; then \
 		ln -sf liftover_ext$(PYTHON_EXT_SUFFIX) liftover_ext.so; \
 	fi
+
+# ── SequenceLocate-only tools ──────────────────────────────────────────────
+# These link a DIFFERENT gbwt (the one providing SequenceLocate) plus vg's
+# sdsl / gbwtgraph / handlegraph. Kept out of liftover_ext.so on purpose: two
+# gbwt versions in one binary would be an ODR violation, so each is a
+# standalone binary. Override the two paths on the command line to build
+# elsewhere, e.g. make SEQT_GBWT=/path/to/gbwt bin/sri_anchors
+SEQT_VG   ?= /private/groups/cgl/seeskand/1.server/Giraffe_server
+SEQT_GBWT ?= /private/groups/cgl/seeskand/2.gbwt_translation/gbwt
+SEQT_CXXFLAGS = -std=c++17 -O3 -march=native -fopenmp -pthread \
+  -I$(SEQT_GBWT)/include -I$(SEQT_VG)/include
+SEQT_LIBS = $(SEQT_VG)/lib/libgbwtgraph.a $(SEQT_GBWT)/lib/libgbwt.a \
+  $(SEQT_VG)/lib/libhandlegraph.a $(SEQT_VG)/lib/libsdsl.a -lzstd -lcrypto
+
+SEQT_PROGRAMS = bin/sequence_translate bin/sequence_translate_batch \
+  bin/sequence_translate_bench bin/sri_build bin/sri_anchors
+
+seqt: $(SEQT_PROGRAMS)
+
+bin/sequence_translate: src/sequence_translate_main.cpp src/sequence_translation.cpp
+	@mkdir -p bin
+	$(CXX) $(SEQT_CXXFLAGS) -o $@ src/sequence_translate_main.cpp $(SEQT_LIBS)
+
+bin/sequence_translate_batch: src/sequence_translate_batch.cpp src/sequence_translation.cpp
+	@mkdir -p bin
+	$(CXX) $(SEQT_CXXFLAGS) -o $@ src/sequence_translate_batch.cpp $(SEQT_LIBS)
+
+bin/sequence_translate_bench: src/sequence_translate_bench.cpp src/sequence_translation.cpp
+	@mkdir -p bin
+	$(CXX) $(SEQT_CXXFLAGS) -o $@ src/sequence_translate_bench.cpp $(SEQT_LIBS)
+
+bin/sri_build: src/sri_build.cpp
+	@mkdir -p bin
+	$(CXX) $(SEQT_CXXFLAGS) -o $@ src/sri_build.cpp $(SEQT_LIBS)
+
+bin/sri_anchors: src/sri_anchor_main.cpp src/sri_anchor_builder.cpp
+	@mkdir -p bin
+	$(CXX) $(SEQT_CXXFLAGS) -o $@ src/sri_anchor_main.cpp $(SEQT_LIBS)
+
 
 clean:
 	rm -rf $(BUILD_BIN) $(BUILD_LIB) $(BUILD_OBJ)

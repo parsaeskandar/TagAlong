@@ -6,6 +6,7 @@
 #include "pangenome_index/surject_anchor_builder.hpp"
 #include "pangenome_index/translation_tables.hpp"
 #include <gbwt/fast_locate.h>
+#include <gbwt/sequence_locate.h>
 #include <gbwtgraph/gbz.h>
 #include <cstdint>
 #include <memory>
@@ -259,12 +260,34 @@ public:
     /// @param table2_path     Path to Translation Table 2 (.t2).
     /// `table2_path` may be empty: translation then uses the table-free path
     /// (translate_no_table2), which needs only Table 1 plus the GBWT/tag array.
+    /// Load the index. Only `gbz_path` is required.
+    ///
+    /// Pass `sri_path` to use the SequenceLocate backend for translation and
+    /// surjection anchors; the RLBWT r-index, sampled tag array and GBWT
+    /// FastLocate are then unnecessary and may be left empty, which is the
+    /// point -- they are ~110 GB and the .sri is ~11 GB. Supplying the old
+    /// paths and no .sri keeps the previous behaviour exactly.
     void load(const std::string& gbz_path,
-              const std::string& ri_path,
-              const std::string& tags_path,
-              const std::string& gbwt_ri_path,
-              const std::string& table1_path,
-              const std::string& table2_path = "");
+              const std::string& ri_path = "",
+              const std::string& tags_path = "",
+              const std::string& gbwt_ri_path = "",
+              const std::string& table1_path = "",
+              const std::string& table2_path = "",
+              const std::string& sri_path = "");
+
+    /// True when a .sri is loaded, i.e. translate() and build_surject_anchors()
+    /// are running on the SequenceLocate backend.
+    bool has_sri() const { return have_sri_; }
+
+    /// SequenceLocate implementations behind translate() and
+    /// build_surject_anchors(). Called automatically when a .sri is loaded;
+    /// set PANGENOME_NO_SRI=1 to force the tag-array path instead.
+    std::vector<TranslatedInterval>
+    translate_sri(const std::string& src_haplotype, int64_t start, int64_t end,
+                  const std::string& tgt_haplotype) const;
+    AnchorBuildPyResult
+    build_surject_anchors_sri(const std::string& gaf_str,
+                              const std::string& target_haplotype) const;
 
     /// True if a Table 2 was loaded. When false, translate() and
     /// translatable_haplotypes() automatically use their table-free forms.
@@ -394,6 +417,12 @@ public:
     AnchorWalkSim simulate_anchor_walk(const std::string& gaf_str,
                                        const std::string& target_haplotype) const;
 
+    /// Export a GAF's parsed source mappings as (node_id, is_reverse,
+    /// read_begin, read_end), so an out-of-process builder can be fed the
+    /// identical input this Index would use.
+    std::vector<std::tuple<int64_t, bool, size_t, size_t>>
+    source_mappings_for_gaf(const std::string& gaf_str) const;
+
 private:
     bool loaded_ = false;
 
@@ -404,6 +433,8 @@ private:
     panindexer::TranslationTable1 table1_;
     panindexer::TranslationTable2 table2_;
     bool has_table2_ = false;
+    std::unique_ptr<gbwt::SequenceLocate> sri_;
+    bool have_sri_ = false;
     /// Haplotype names, cached at load(): deriving them walks every GBWT path.
     std::vector<std::string> haplotype_names_;
     std::unordered_map<size_t, std::pair<std::string, size_t>> path_to_global_;

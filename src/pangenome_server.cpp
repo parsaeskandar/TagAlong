@@ -28,6 +28,11 @@
 
 #include "pangenome_server.hpp"
 
+// The SequenceLocate backends. Both are header-style translation units in their
+// own namespaces, included rather than linked so they stay usable standalone.
+#include "sequence_translation.cpp"
+#include "sri_anchor_builder.cpp"
+
 using panindexer::FastLocate;
 using panindexer::SampledTagArray;
 using panindexer::TranslationTable1;
@@ -467,7 +472,8 @@ void Index::load(const std::string& gbz_path,
                  const std::string& tags_path,
                  const std::string& gbwt_ri_path,
                  const std::string& table1_path,
-                 const std::string& table2_path) {
+                 const std::string& table2_path,
+                 const std::string& sri_path) {
     // Pinning pages in RAM (mlockall) avoids page-fault stalls during queries,
     // but mlockall(MCL_CURRENT | MCL_FUTURE) makes EVERY later allocation fail
     // when RLIMIT_MEMLOCK (`ulimit -l`) is too small to lock the working set —
@@ -489,7 +495,9 @@ void Index::load(const std::string& gbz_path,
         if (verbose) std::cerr << "[Index::load] " << msg << std::endl;
     };
 
-    // 1. RLBWT r-index
+    // 1. RLBWT r-index -- only when a path was given. With a .sri this index
+    //    is not used by translation or anchor building, and it is ~81 GB.
+    if (!ri_path.empty()) {
     log_step(("[1/5] RLBWT r-index: " + ri_path).c_str());
     {
         std::ifstream rin(ri_path, std::ios::binary);
@@ -509,6 +517,7 @@ void Index::load(const std::string& gbz_path,
         rlbwt_rindex_.ensure_blocks_start_select();
         log_step("[1/5]   ensure_blocks_start_select done");
     }
+    }
 
     // 2. GBZ (GBWT + GBWTGraph)
     log_step(("[2/5] GBZ: " + gbz_path).c_str());
@@ -516,7 +525,8 @@ void Index::load(const std::string& gbz_path,
     sdsl::simple_sds::load_from(*gbz_, gbz_path);
     log_step("[2/5]   loaded");
 
-    // 3. GBWT FastLocate
+    // 3. GBWT FastLocate -- optional for the same reason as the RLBWT above.
+    if (!gbwt_ri_path.empty()) {
     log_step(("[3/5] GBWT FastLocate: " + gbwt_ri_path).c_str());
     {
         std::ifstream gin(gbwt_ri_path, std::ios::binary);
@@ -531,8 +541,36 @@ void Index::load(const std::string& gbz_path,
         gbwt_rindex_->setGBWT(gbz_->index);
         log_step("[3/5]   loaded");
     }
+    }
 
-    // 4. Sampled tag array
+    // 3b. SequenceLocate. Offsets in base pairs, so it answers on its own what
+    //     the FastLocate + tag-array pair needed two indexes and a positional
+    //     zip to answer. setGBWT() is REQUIRED after load.
+    if (!sri_path.empty()) {
+        log_step(("[3b] SequenceLocate: " + sri_path).c_str());
+        std::ifstream sin(sri_path, std::ios::binary);
+        if (!sin) throw std::runtime_error("Cannot open SequenceLocate: " + sri_path);
+        sri_ = std::make_unique<gbwt::SequenceLocate>();
+        sri_->load(sin);
+        const gbwtgraph::GBWTGraph* graph = &gbz_->graph;
+        sri_->setGBWT(gbz_->index,
+            [graph](gbwt::node_type node) -> gbwt::size_type {
+                return graph->get_length(gbwtgraph::GBWTGraph::node_to_handle(node));
+            });
+        // The .sri carries no checksum, and a mismatched pair would silently
+        // give plausible-looking wrong coordinates.
+        if (sri_->sequence_length.size() != gbz_->index.sequences() || sri_->size() == 0) {
+            throw std::runtime_error(
+                "SequenceLocate does not match this GBZ (" +
+                std::to_string(sri_->sequence_length.size()) + " vs " +
+                std::to_string(gbz_->index.sequences()) + " sequences)");
+        }
+        have_sri_ = true;
+        log_step("[3b]   loaded");
+    }
+
+    // 4. Sampled tag array -- optional; unused when a .sri is loaded.
+    if (!tags_path.empty()) {
     log_step(("[4/5] Sampled tag array: " + tags_path).c_str());
     {
         std::ifstream sin(tags_path, std::ios::binary);
@@ -545,8 +583,11 @@ void Index::load(const std::string& gbz_path,
         sampled_.ensure_run_select();
         log_step("[4/5]   ensure_run_select done");
     }
+    }
 
-    // 5. Translation tables
+    // 5. Translation tables. T1 is optional too: the SequenceLocate path
+    //    resolves names straight from GBWT metadata and never consults it.
+    if (!table1_path.empty()) {
     log_step(("[5/5] Table 1: " + table1_path).c_str());
     {
         std::ifstream t1in(table1_path, std::ios::binary);
@@ -555,6 +596,7 @@ void Index::load(const std::string& gbz_path,
         table1_.load(t1in);
     }
     log_step("[5/5]   T1 loaded");
+    }
     // Table 2 is OPTIONAL. Pass an empty path to run without it: translation
     // then routes through the GBWT/tag array (translate_no_table2), which needs
     // no per-path-pair table and so is unaffected by how finely the graph
@@ -1169,6 +1211,13 @@ Index::translate(const std::string& src_haplotype,
     if (!loaded_)
         throw std::runtime_error("Index::translate called before load()");
     if (timed_out) *timed_out = false;
+
+    // SequenceLocate backend, when a .sri is loaded. Needs neither translation
+    // table nor tag array; set PANGENOME_NO_SRI=1 to force the old path for A/B.
+    static const bool no_sri_env = (std::getenv("PANGENOME_NO_SRI") != nullptr);
+    if (have_sri_ && !no_sri_env) {
+        return translate_sri(src_haplotype, start, end, tgt_haplotype);
+    }
 
     // Table 2 is the default whenever one is loaded. The table-free path (via
     // first/last common node through the GBWT/tag array) is the fallback when
@@ -2199,6 +2248,121 @@ AnchorWalkSim Index::simulate_anchor_walk(
     return out;
 }
 
+
+// ── SequenceLocate backends ────────────────────────────────────────────────
+
+/// translate() on the .sri. Emits the same per-base correspondences the old
+/// path does: one record per covered base, .start = source offset,
+/// .end = target offset.
+std::vector<TranslatedInterval>
+Index::translate_sri(const std::string& src_haplotype,
+                     int64_t start, int64_t end,
+                     const std::string& tgt_haplotype) const {
+    std::vector<TranslatedInterval> out;
+    if (start < 0 || end <= start) return out;
+
+    seqtrans::Translator tr(*gbz_, *sri_);
+    std::vector<gbwt::size_type> tgt_ids = tr.resolve(tgt_haplotype);
+    if (tgt_ids.empty()) return out;
+
+    seqtrans::Stats st;
+    std::vector<seqtrans::Block> blocks = tr.translate(
+        src_haplotype, static_cast<size_t>(start), static_cast<size_t>(end),
+        tgt_ids, st, seqtrans::Mode::WALK);
+
+    for (const seqtrans::Block& b : blocks) {
+        const size_t span = b.src_end - b.src_start;
+        for (size_t i = 0; i < span; i++) {
+            TranslatedInterval ti;
+            ti.haplotype      = b.target_contig;
+            ti.target_path_id = static_cast<int64_t>(b.tgt_path_id);
+            ti.start = static_cast<int64_t>(b.src_start + i);
+            ti.end   = (b.strand == '+')
+                     ? static_cast<int64_t>(b.tgt_start + i)
+                     : static_cast<int64_t>(b.tgt_end - 1 - i);
+            ti.strand = b.strand;
+            out.push_back(ti);
+        }
+    }
+    return out;
+}
+
+/// build_surject_anchors() on the .sri.
+AnchorBuildPyResult
+Index::build_surject_anchors_sri(const std::string& gaf_str,
+                                 const std::string& target_haplotype) const {
+    AnchorBuildPyResult out;
+    const auto t_parse = prof_clock::now();
+    auto src = gaf_to_source_mappings(gaf_str, gbz_->graph);
+    out.parse_ms = ms_since(t_parse);
+    if (src.empty()) { out.status = "parse_error"; return out; }
+    out.n_source_mappings = src.size();
+
+    std::vector<srianchor::SourceMapping> mappings;
+    mappings.reserve(src.size());
+    for (const auto& m : src) {
+        srianchor::SourceMapping sm;
+        sm.node_id = m.node_id;
+        sm.is_reverse = m.is_reverse;
+        sm.read_begin_offset = m.read_begin_offset;
+        sm.read_end_offset = m.read_end_offset;
+        mappings.push_back(sm);
+    }
+
+    srianchor::Builder builder(*gbz_, *sri_);
+    const auto t_resolve = prof_clock::now();
+    std::vector<size_t> pids = builder.resolve(target_haplotype);
+    out.resolve_ms = ms_since(t_resolve);
+    out.n_target_subpaths = pids.size();
+    if (pids.empty()) { out.status = "unknown_path"; return out; }
+
+    const auto t_build = prof_clock::now();
+    srianchor::Stats st;
+    size_t best_pid = 0;
+    std::vector<srianchor::Anchor> anchors = builder.build(mappings, pids, st, &best_pid);
+    out.build_ms = ms_since(t_build);
+    out.n_touched_subpaths = st.touched_paths;
+    out.decompress_sa_calls = st.sa_calls;
+    out.decompress_sa_entries = st.sa_entries;
+    out.target_rev_strand = st.reverse_strand;
+
+    if (anchors.empty()) { out.status = "no_common_nodes"; return out; }
+
+    out.anchors.reserve(anchors.size());
+    for (const srianchor::Anchor& a : anchors) {
+        AnchorRecord r;
+        r.source_mapping_begin = a.source_mapping;
+        r.source_mapping_end   = a.source_mapping + 1;
+        r.read_begin_offset = a.read_begin;
+        r.read_end_offset   = a.read_end;
+        r.path_offset_step_begin = a.path_offset;
+        r.path_offset_step_end   = a.path_offset;
+        r.gbwt_edge_begin_node   = a.edge_node;
+        r.gbwt_edge_begin_offset = a.edge_offset;
+        r.gbwt_edge_end_node     = a.edge_node;
+        r.gbwt_edge_end_offset   = a.edge_offset;
+        out.anchors.push_back(r);
+    }
+    out.target_path_length = sri_->sequenceLength(gbwt::Path::encode(best_pid, false));
+    out.status = "ok";
+    return out;
+}
+
+/// Export a GAF's parsed source mappings so an out-of-process builder gets the
+/// identical input.
+std::vector<std::tuple<int64_t, bool, size_t, size_t>>
+Index::source_mappings_for_gaf(const std::string& gaf_str) const {
+    if (!loaded_) {
+        throw std::runtime_error("Index::source_mappings_for_gaf called before load()");
+    }
+    std::vector<std::tuple<int64_t, bool, size_t, size_t>> out;
+    for (const auto& m : gaf_to_source_mappings(gaf_str, gbz_->graph)) {
+        out.emplace_back(m.node_id, m.is_reverse,
+                         m.read_begin_offset, m.read_end_offset);
+    }
+    return out;
+}
+
 AnchorBuildPyResult Index::build_surject_anchors(
     const std::string& gaf_str,
     const std::string& target_haplotype) const
@@ -2212,6 +2376,11 @@ AnchorBuildPyResult Index::build_surject_anchors(
     // Stage timers: find_seq dominates, but "dominates" should be measured, not
     // assumed -- GAF parsing, T1 name resolution and the per-subpath loop are all
     // candidates and none were timed before.
+    static const bool no_sri_env = (std::getenv("PANGENOME_NO_SRI") != nullptr);
+    if (have_sri_ && !no_sri_env) {
+        return build_surject_anchors_sri(gaf_str, target_haplotype);
+    }
+
     const auto _t_parse = prof_clock::now();
     auto source_mappings = gaf_to_source_mappings(gaf_str, gbz_->graph);
     out.parse_ms = ms_since(_t_parse);

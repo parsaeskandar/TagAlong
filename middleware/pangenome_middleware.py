@@ -42,12 +42,21 @@ from .giraffe_server_middleware import (
 
 @dataclass
 class CoordinateIndexPaths:
+    """Only gbz_path is required.
+
+    Pass sri_path to run translation and surjection anchors on the
+    SequenceLocate backend; the RLBWT r-index, sampled tag array, GBWT
+    FastLocate and translation tables are then unused and can be left empty
+    (~110 GB of index, and load drops from ~310 s to ~80 s). Supplying the old
+    paths and no sri_path keeps the previous behaviour exactly.
+    """
     gbz_path: str
-    ri_path: str
-    tags_path: str
-    gbwt_ri_path: str
-    table1_path: str
+    ri_path: str = ""
+    tags_path: str = ""
+    gbwt_ri_path: str = ""
+    table1_path: str = ""
     table2_path: str = ""      # optional: empty = table-free translation
+    sri_path: str = ""         # optional: non-empty = SequenceLocate backend
 
 
 # Result of building anchors for one graph alignment onto a target haplotype:
@@ -218,6 +227,7 @@ class PangenomeMiddleware:
             coord_paths.gbwt_ri_path,
             coord_paths.table1_path,
             coord_paths.table2_path,
+            coord_paths.sri_path,
         )
         # Coordinate queries run CONCURRENTLY by default. An audit of the query
         # path found no shared mutable state: every method it calls on
@@ -248,11 +258,12 @@ class PangenomeMiddleware:
         minimizer: str,
         distance: str,
         zipcodes: str,
-        ri: str,
-        tags: str,
-        gbwt_ri: str,
-        t1: str,
+        ri: str = "",
+        tags: str = "",
+        gbwt_ri: str = "",
+        t1: str = "",
         t2: str = "",
+        sri: str = "",
         threads: int = 8,
         max_multimaps: int = 1,
         batch_size: int = 256,
@@ -273,6 +284,7 @@ class PangenomeMiddleware:
             gbwt_ri_path=gbwt_ri,
             table1_path=t1,
             table2_path=t2,
+            sri_path=sri,
         )
         giraffe_cfg = GiraffeServerConfig(
             vg_binary=vg_binary,
