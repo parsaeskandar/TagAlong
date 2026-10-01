@@ -97,6 +97,39 @@ public:
     }
 
     /// Contig name as the rest of the stack spells it: sample#hap#contig.
+    /// The source's visited nodes over [start, end), in path order, one entry
+    /// per visit. Oriented the way the source traverses them, which is what a
+    /// "who else is here" query must ask.
+    std::vector<gbwt::node_type> source_nodes(const std::string& src_name,
+                                              size_t start, size_t end,
+                                              Stats& st) const {
+        std::vector<gbwt::node_type> nodes;
+        if (end <= start) return nodes;
+        for (gbwt::size_type src_pid : fragments_for(src_name, start, end)) {
+            gbwt::FullPathName fp = gbz_.index.metadata.fullPath(src_pid);
+            const gbwt::size_type src_seq = gbwt::Path::encode(src_pid, false);
+            const size_t frag_len = sri_.sequenceLength(src_seq);
+            const size_t frag_off = fp.offset;
+            const size_t lo = (start > frag_off) ? (start - frag_off) : 0;
+            const size_t hi = std::min(end - frag_off, frag_len);
+            if (lo >= hi) continue;
+            st.fragments++;
+
+            gbwt::edge_type gpos;
+            gbwt::edge_type base = sri_.locateSequence(src_seq, lo, gpos);
+            st.locate_sequence++;
+            if (base == gbwt::invalid_edge() || gpos == gbwt::invalid_edge()) continue;
+            size_t node_start = lo - base.second;
+            while (gpos.first != gbwt::ENDMARKER && node_start < hi) {
+                nodes.push_back(gpos.first);
+                st.nodes_walked++;
+                node_start += node_len(gpos.first);
+                gpos = gbz_.index.LF(gpos);
+            }
+        }
+        return nodes;
+    }
+
     std::string contig_name(gbwt::size_type path_id) const {
         gbwt::FullPathName fp = gbz_.index.metadata.fullPath(path_id);
         return fp.sample_name + "#" + std::to_string(fp.haplotype) + "#" + fp.contig_name;

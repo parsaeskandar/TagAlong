@@ -288,6 +288,11 @@ public:
     AnchorBuildPyResult
     build_surject_anchors_sri(const std::string& gaf_str,
                               const std::string& target_haplotype) const;
+    std::vector<HaplotypeCoverage>
+    translatable_haplotypes_scored_sri(const std::string& src_haplotype,
+                                       int64_t start, int64_t end,
+                                       double min_coverage = 0.0,
+                                       size_t max_nodes = 0) const;
 
     /// True if a Table 2 was loaded. When false, translate() and
     /// translatable_haplotypes() automatically use their table-free forms.
