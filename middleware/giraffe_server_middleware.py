@@ -271,16 +271,19 @@ class GiraffeServerMiddleware:
         if self._proc is None:
             self.start()
 
-        anchor_list = list(anchors) if anchors is not None else []
-        n_anchors = len(anchor_list)
-        path_len = int(target_path_length) if target_path_length else 0
-
         rid = next(self._ids)
         u = f"s{rid}"                       # unique framing name for demux
+        block = self._surject_block(u, graph_alignment_gaf, anchors,
+                                    target_haplotype, target_path_length)
+        frames = self._submit([("surject", block)], [u], self.cfg.output_timeout_s)
+        return frames.get(u, [])
 
-        parts = [
-            f"SURJECT_WITH_ANCHORS\t{u}\t{target_haplotype}\t{path_len}\t{n_anchors}\n"
-        ]
+    @staticmethod
+    def _surject_block(u: str, gaf: str, anchors, target: str, path_len) -> str:
+        """One SURJECT_WITH_ANCHORS request: header, anchor lines, GAF line."""
+        anchor_list = list(anchors) if anchors is not None else []
+        parts = [f"SURJECT_WITH_ANCHORS\t{u}\t{target}\t"
+                 f"{int(path_len) if path_len else 0}\t{len(anchor_list)}\n"]
         for a in anchor_list:
             parts.append(
                 f"{a.gbwt_edge_begin_node}\t{a.gbwt_edge_begin_offset}\t"
@@ -289,13 +292,29 @@ class GiraffeServerMiddleware:
                 f"{a.read_begin_offset}\t{a.read_end_offset}\t"
                 f"{a.source_mapping_begin}\t{a.source_mapping_end}\n"
             )
-        gaf = graph_alignment_gaf if graph_alignment_gaf.endswith("\n") \
-            else graph_alignment_gaf + "\n"
-        parts.append(gaf)
-        block = "".join(parts)
+        parts.append(gaf if gaf.endswith("\n") else gaf + "\n")
+        return "".join(parts)
 
-        frames = self._submit([("surject", block)], [u], self.cfg.output_timeout_s)
-        return frames.get(u, [])
+    def surject_with_anchors_batch(self, requests) -> List[List[str]]:
+        """Surject many (gaf, anchors, target, path_len) requests in ONE submit.
+
+        Returns the surjected GAF lines per request, in input order. vg runs
+        the blocks on its --surject-threads pool, so N targets cost about one
+        round trip instead of N sequential ones."""
+        if self._proc is None:
+            self.start()
+        reqs = list(requests)
+        if not reqs:
+            return []
+        rid = next(self._ids)
+        items: List[Tuple[str, str]] = []
+        unique: List[str] = []
+        for i, (gaf, anchors, target, path_len) in enumerate(reqs):
+            u = f"s{rid}_{i}"
+            items.append(("surject", self._surject_block(u, gaf, anchors, target, path_len)))
+            unique.append(u)
+        frames = self._submit(items, unique, self.cfg.output_timeout_s)
+        return [frames.get(u, []) for u in unique]
 
     def wait_until_ready(self) -> None:
         """Block until giraffe-server answers a probe read — the only reliable

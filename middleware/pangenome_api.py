@@ -39,6 +39,13 @@ Endpoints:
   POST /api/v1/liftover/targets {src, start, end}   (synchronous, names only)
       -> 200 {haplotypes:[...]}   haplotypes this source interval CAN translate to
   GET  /api/v1/haplotypes     -> 200 {haplotypes:[...]}   (2-field names)
+  POST /api/v1/surject_all    {job_id, name[, index] | gaf}
+                              [, min_coverage (default 50), max_targets (default 50, cap 500)]
+      -> 200 {candidates, truncated, haplotypes:[{haplotype, status, strand,
+              target_start, target_end, cigar, identity, ..., coverage,
+              graph_identity}]}  every haplotype with coverage >= min_coverage,
+              best first; one anchor pass, surjected in parallel, cached on the
+              job so a later /api/v1/surject to any of them is immediate.
   GET  /healthz               -> 200 {status, ready, ...load/metrics}   (no auth)
 
 Defense-in-depth (the CGI also rate-limits/validates, but we don't trust it):
@@ -93,6 +100,11 @@ MAX_LIFTOVER_TIMEOUT_MS = 60000
 # Per-haplotype alignments are one surjection each (anchor build + surject), the
 # most expensive stage per read, so the fan-out is bounded.
 MAX_ALIGNMENT_TARGETS = 20
+# /api/v1/surject_all: haplotypes at or above DEFAULT_SURJECT_MIN_COVERAGE are
+# surjected, at most max_targets of them (caller may raise it up to the cap).
+DEFAULT_SURJECT_MIN_COVERAGE = 50.0
+DEFAULT_SURJECT_MAX_TARGETS = 50
+MAX_SURJECT_ALL_TARGETS = 500
 # Total bytes of cached graph alignments (GAFs) retained across live jobs for
 # re-surjection. A long read's GAF path is tens of KB, so an unbounded cache
 # would reach gigabytes on a box that already holds the pangenome index. Past
@@ -287,6 +299,50 @@ class Busy(Exception):
     pass
 
 
+def _sj_from_lines(lines: List[str]) -> Optional[Dict[str, Any]]:
+    """The surjection dict from the first surjected GAF line, or None."""
+    if not lines:
+        return None
+    sc = lines[0].split("\t")
+    return _surjection_from_tags(
+        _parse_tags(sc[_GAF_TAG_START:]) if len(sc) > _GAF_TAG_START else {})
+
+
+def _alignment_record(t: str, status: str, sj: Optional[Dict[str, Any]],
+                      qstart: int, qend: int) -> Dict[str, Any]:
+    """One per-haplotype alignment entry, as the map job has always reported it."""
+    if status != "ok":
+        if status.startswith("no_anchors"):
+            return {"haplotype": t, "status": "no_anchors",
+                    "detail": status[len("no_anchors"):].strip(" ()")}
+        return {"haplotype": t, "status": status}
+    if not sj:
+        return {"haplotype": t, "status": "surjection_failed"}
+    if sj.get("status") != "ok":
+        return {"haplotype": t, "status": sj.get("status", "surjection_failed")}
+    _qspan, tspan = _cigar_spans(sj.get("cigar"))
+    pos = sj.get("position")
+    return {
+        "haplotype": sj.get("target") or t,
+        "requested": t,
+        "status": "ok",
+        "strand": sj.get("strand"),
+        "query_start": qstart,
+        "query_end": qend,
+        "target_start": pos,
+        "target_end": (pos + tspan) if pos is not None else None,
+        "cigar": sj.get("cigar"),
+        "matches": sj.get("matches"),
+        "mismatches": sj.get("mismatches"),
+        "inserted": sj.get("inserted"),
+        "deleted": sj.get("deleted"),
+        "aligned_bases": sj.get("aligned_bases"),
+        "identity": sj.get("identity"),
+        "score": sj.get("score"),
+        "mapping_quality": sj.get("mapping_quality"),
+    }
+
+
 @dataclass
 class Job:
     job_id: str
@@ -307,6 +363,12 @@ class Job:
     # (they are long and the caller normally does not need them).
     gafs: Dict[str, List[str]] = field(default_factory=dict)
     gaf_bytes: int = 0
+    # Surjections already computed for this job, keyed (name, index, target) ->
+    # (status, sj). Filled by surject_all and the map job's per-haplotype
+    # alignments, read by /api/v1/surject, so switching haplotype in the browser
+    # is a lookup. Lives and expires with the job.
+    surjections: Dict[Tuple[str, int, str], Tuple[str, Optional[Dict[str, Any]]]] = \
+        field(default_factory=dict)
     done_evt: threading.Event = field(default_factory=threading.Event)
 
     def envelope(self) -> Dict[str, Any]:
@@ -404,29 +466,85 @@ class Service:
             raise NotReady()
         if self._stub:
             return {"status": "stub"}
-        if not gaf:
-            job = self.get(job_id)
-            if job is None:
-                raise KeyError("unknown or expired job")
-            lines = job.gafs.get(name)
-            if not lines:
-                raise KeyError(f"no cached alignment for sequence {name!r}")
-            if index < 0 or index >= len(lines):
-                raise IndexError(f"alignment index {index} out of range "
-                                 f"({len(lines)} available)")
-            gaf = lines[index]
-
-        anchors, path_len, status = self._mw.build_surject_anchors(gaf, tgt)
-        if not anchors:
-            return {"status": "surjection_failed", "detail": f"no_anchors ({status})"}
-        out = self._mw.surject_with_anchors(gaf, anchors, tgt,
-                                            target_path_length=path_len)
-        if not out:
-            return {"status": "surjection_failed"}
-        cols = out[0].split("\t")
-        sj = _surjection_from_tags(
-            _parse_tags(cols[_GAF_TAG_START:]) if len(cols) > _GAF_TAG_START else {})
+        gaf, job = self._resolve_gaf(job_id, name, index, gaf)
+        (_t, status, sj), = self._surject_cached(gaf, [tgt], job, name, index)
+        if status != "ok":
+            return {"status": "surjection_failed", "detail": status}
         return sj or {"status": "surjection_failed"}
+
+    def surject_all(self, job_id: str = "", name: str = "", index: int = 0,
+                    gaf: str = "",
+                    min_coverage: float = DEFAULT_SURJECT_MIN_COVERAGE,
+                    max_targets: int = DEFAULT_SURJECT_MAX_TARGETS) -> Dict[str, Any]:
+        """Surject one alignment onto every haplotype that carries it.
+
+        Candidates are the haplotypes whose coverage of the alignment is at
+        least `min_coverage`, best first, at most `max_targets` of them. One
+        anchor pass serves them all and vg surjects them in parallel; results
+        are cached on the job, so a later /api/v1/surject to any of them is a
+        lookup."""
+        if not self._ready:
+            raise NotReady()
+        if self._stub:
+            return {"status": "stub", "haplotypes": []}
+        gaf, job = self._resolve_gaf(job_id, name, index, gaf)
+        cap = max(1, min(int(max_targets), MAX_SURJECT_ALL_TARGETS))
+        cov = self._mw.haplotype_coverage(gaf, float(min_coverage), False)
+        cov.sort(key=lambda r: (-r["coverage"], r["haplotype"]))
+        chosen = cov[:cap]
+        cols = gaf.split("\t")
+        qstart = int(cols[2]) if len(cols) > 2 and cols[2].isdigit() else 0
+        qend = int(cols[3]) if len(cols) > 3 and cols[3].isdigit() else 0
+        results = self._surject_cached(gaf, [r["haplotype"] for r in chosen], job, name, index)
+        haplotypes = []
+        for c, (t, status, sj) in zip(chosen, results):
+            rec = _alignment_record(t, status, sj, qstart, qend)
+            # The haplotype's graph-level scores, next to its surjection. The
+            # record's own "identity" is the SURJECTED alignment's.
+            rec["coverage"] = c["coverage"]
+            if "identity" in c:
+                rec["graph_identity"] = c["identity"]
+            haplotypes.append(rec)
+        return {"min_coverage": float(min_coverage), "max_targets": cap,
+                "candidates": len(cov), "truncated": len(cov) > cap,
+                "haplotypes": haplotypes}
+
+    def _resolve_gaf(self, job_id: str, name: str, index: int,
+                     gaf: str) -> Tuple[str, Optional["Job"]]:
+        """The alignment to surject: given directly, or a cached job's."""
+        if gaf:
+            return gaf, None
+        job = self.get(job_id)
+        if job is None:
+            raise KeyError("unknown or expired job")
+        lines = job.gafs.get(name)
+        if not lines:
+            raise KeyError(f"no cached alignment for sequence {name!r}")
+        if index < 0 or index >= len(lines):
+            raise IndexError(f"alignment index {index} out of range "
+                             f"({len(lines)} available)")
+        return lines[index], job
+
+    def _surject_cached(self, gaf: str, targets: List[str], job: Optional["Job"],
+                        name: str, index: int
+                        ) -> List[Tuple[str, str, Optional[Dict[str, Any]]]]:
+        """(target, status, sj) per target, in order. Reuses surjections already
+        on the job and batches the rest into one surject_many call."""
+        done: Dict[str, Tuple[str, Optional[Dict[str, Any]]]] = {}
+        todo: List[str] = []
+        for t in targets:
+            hit = job.surjections.get((name, index, t)) if job is not None else None
+            if hit is not None:
+                done[t] = hit
+            elif t not in todo:
+                todo.append(t)
+        if todo:
+            for t, status, lines in self._mw.surject_many(gaf, todo):
+                rec = (status, _sj_from_lines(lines) if status == "ok" else None)
+                done[t] = rec
+                if job is not None:
+                    job.surjections[(name, index, t)] = rec
+        return [(t, done[t][0], done[t][1]) for t in targets]
 
     def haplotypes(self) -> List[str]:
         if not self._ready:
@@ -544,7 +662,8 @@ class Service:
                         gaf, surject, explicit_target, primary=(j == 0),
                         coverage=want_coverage, min_coverage=min_coverage,
                         include_zero=include_zero,
-                        align_for=align_for, align_top=align_top))
+                        align_for=align_for, align_top=align_top,
+                        job=job, name=seq["name"], index=j))
                 results.append({"name": seq["name"], "status": "mapped",
                                 "error": None, "query_length": qlen, "alignments": alns})
             job.completed = i + 1
@@ -557,7 +676,9 @@ class Service:
                          min_coverage: float = 0.0,
                          include_zero: bool = False,
                          align_for: Optional[List[str]] = None,
-                         align_top: int = 0) -> Dict[str, Any]:
+                         align_top: int = 0,
+                         job: Optional["Job"] = None, name: str = "",
+                         index: int = 0) -> Dict[str, Any]:
         cols = gaf.split("\t")
         # GAF query coords (0-based half-open) - PSL needs them per alignment.
         qstart = int(cols[2]) if len(cols) > 2 and cols[2].isdigit() else 0
@@ -580,18 +701,11 @@ class Service:
             target = explicit_target or haplotypes["representative"]
             if target:
                 try:
-                    anchors, path_len, status = self._mw.build_surject_anchors(gaf, target)
-                    if anchors:
-                        lines = self._mw.surject_with_anchors(
-                            gaf, anchors, target, target_path_length=path_len)
-                        if lines:
-                            scols = lines[0].split("\t")
-                            surjection = _surjection_from_tags(
-                                _parse_tags(scols[_GAF_TAG_START:]) if len(scols) > _GAF_TAG_START else {})
-                        else:
-                            surjection = {"status": "surjection_failed"}
+                    (_t, status, sj), = self._surject_cached(gaf, [target], job, name, index)
+                    if status != "ok":
+                        surjection = {"status": "surjection_failed", "detail": status}
                     else:
-                        surjection = {"status": "surjection_failed", "detail": f"no_anchors ({status})"}
+                        surjection = sj or {"status": "surjection_failed"}
                 except Exception as exc:
                     surjection = {"status": "surjection_failed", "detail": str(exc)}
             else:
@@ -606,49 +720,15 @@ class Service:
             targets = list(align_for)
         elif align_top and haplotype_coverage:
             targets = [h["haplotype"] for h in haplotype_coverage[:align_top]]
-        for t in targets[:MAX_ALIGNMENT_TARGETS]:
+        # All targets in one batch: one anchor pass, one vg submit run in parallel.
+        targets = targets[:MAX_ALIGNMENT_TARGETS]
+        if targets:
             try:
-                anchors, path_len, status = self._mw.build_surject_anchors(gaf, t)
-                if not anchors:
-                    alignments.append({"haplotype": t, "status": "no_anchors",
-                                       "detail": status})
-                    continue
-                lines = self._mw.surject_with_anchors(gaf, anchors, t,
-                                                      target_path_length=path_len)
-                if not lines:
-                    alignments.append({"haplotype": t, "status": "surjection_failed"})
-                    continue
-                sc = lines[0].split("\t")
-                sj = _surjection_from_tags(
-                    _parse_tags(sc[_GAF_TAG_START:]) if len(sc) > _GAF_TAG_START else {})
-                if not sj or sj.get("status") != "ok":
-                    alignments.append({"haplotype": t,
-                                       "status": (sj or {}).get("status", "surjection_failed")})
-                    continue
-                _qspan, tspan = _cigar_spans(sj.get("cigar"))
-                pos = sj.get("position")
-                alignments.append({
-                    "haplotype": sj.get("target") or t,
-                    "requested": t,
-                    "status": "ok",
-                    "strand": sj.get("strand"),
-                    "query_start": qstart,
-                    "query_end": qend,
-                    "target_start": pos,
-                    "target_end": (pos + tspan) if pos is not None else None,
-                    "cigar": sj.get("cigar"),
-                    "matches": sj.get("matches"),
-                    "mismatches": sj.get("mismatches"),
-                    "inserted": sj.get("inserted"),
-                    "deleted": sj.get("deleted"),
-                    "aligned_bases": sj.get("aligned_bases"),
-                    "identity": sj.get("identity"),
-                    "score": sj.get("score"),
-                    "mapping_quality": sj.get("mapping_quality"),
-                })
+                for t, status, sj in self._surject_cached(gaf, targets, job, name, index):
+                    alignments.append(_alignment_record(t, status, sj, qstart, qend))
             except Exception as exc:
-                alignments.append({"haplotype": t, "status": "error",
-                                   "detail": str(exc)})
+                alignments = [{"haplotype": t, "status": "error", "detail": str(exc)}
+                              for t in targets]
 
         return {
             "primary": primary,
@@ -920,6 +1000,52 @@ def make_handler(service: Service, cfg: ApiConfig):
 
             self._send_json(200, {"haplotype": tgt, "surjection": sj})
 
+        def _handle_surject_all(self, payload: Dict[str, Any]) -> None:
+            """Surject one alignment onto every haplotype that carries it, in one
+            request. Same addressing as /api/v1/surject, minus 'tgt'."""
+            gaf = payload.get("gaf") or ""
+            job_id = payload.get("job_id") or ""
+            name = payload.get("name") or ""
+            if not isinstance(gaf, str) or not isinstance(job_id, str) or not isinstance(name, str):
+                service.metrics.inc("rejected_400")
+                self._error(400, "'gaf', 'job_id' and 'name' must be strings")
+                return
+            if not gaf and not (job_id and name):
+                service.metrics.inc("rejected_400")
+                self._error(400, "supply either 'gaf', or both 'job_id' and 'name'")
+                return
+            try:
+                index = int(payload.get("index") or 0)
+                min_cov = float(payload.get("min_coverage",
+                                            DEFAULT_SURJECT_MIN_COVERAGE))
+                max_t = int(payload.get("max_targets") or DEFAULT_SURJECT_MAX_TARGETS)
+            except (TypeError, ValueError):
+                service.metrics.inc("rejected_400")
+                self._error(400, "'index', 'min_coverage' and 'max_targets' must be numbers")
+                return
+            if not (0.0 <= min_cov <= 100.0) or max_t < 1:
+                service.metrics.inc("rejected_400")
+                self._error(400, "'min_coverage' must be 0-100 and 'max_targets' >= 1")
+                return
+
+            try:
+                out = service.surject_all(job_id=job_id, name=name, index=index,
+                                          gaf=gaf, min_coverage=min_cov,
+                                          max_targets=max_t)
+            except NotReady:
+                service.metrics.inc("rejected_503")
+                self._error(503, "service starting; indexes not loaded yet")
+                return
+            except (KeyError, IndexError) as exc:
+                service.metrics.inc("rejected_400")
+                self._error(404, str(exc).strip("'"))
+                return
+            except Exception as exc:
+                service.metrics.inc("errored")
+                self._error(500, f"surject_all failed: {exc}")
+                return
+            self._send_json(200, out)
+
         def _handle_liftover_targets(self, payload: Dict[str, Any]) -> None:
             src = payload.get("src")
             start = payload.get("start")
@@ -1013,7 +1139,8 @@ def make_handler(service: Service, cfg: ApiConfig):
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
             path = parsed.path.rstrip("/")
-            if path not in ("/api/v1/map", "/api/v1/surject", "/api/v1/liftover",
+            if path not in ("/api/v1/map", "/api/v1/surject", "/api/v1/surject_all",
+                            "/api/v1/liftover",
                             "/api/v1/liftover/targets"):
                 self._error(404, f"unknown path: {parsed.path}")
                 return
@@ -1037,6 +1164,9 @@ def make_handler(service: Service, cfg: ApiConfig):
 
             if path == "/api/v1/surject":
                 self._handle_surject(payload)
+                return
+            if path == "/api/v1/surject_all":
+                self._handle_surject_all(payload)
                 return
             if path == "/api/v1/liftover":
                 self._handle_liftover(payload)

@@ -515,6 +515,40 @@ class PangenomeMiddleware:
             graph_alignment_gaf, anchors, target, target_path_length=target_path_length
         )
 
+    def build_surject_anchors_multi(self, graph_alignment_gaf: str,
+                                    targets: List[str]) -> List[AnchorBuild]:
+        """build_surject_anchors for many targets in ONE pass over the read's
+        nodes. Returns one (anchors, target_path_length, status) per target, in
+        order. Falls back to one call per target on an extension without it."""
+        fn = getattr(self._coord, "build_surject_anchors_multi", None)
+        if fn is None:
+            return [self.build_surject_anchors(graph_alignment_gaf, t) for t in targets]
+        return [(list(r.anchors), int(r.target_path_length), str(r.status))
+                for r in fn(graph_alignment_gaf, list(targets))]
+
+    def surject_many(self, graph_alignment_gaf: str,
+                     targets: List[str]) -> List[Tuple[str, str, List[str]]]:
+        """Surject one graph alignment onto every target at once.
+
+        One anchor pass serves all targets, and every surjection goes to
+        giraffe-server in a single batch that it runs on its worker pool.
+        Returns (target, status, gaf_lines) per target, in order; status is
+        "ok" or the reason no surjection was attempted ("no_anchors (...)")."""
+        built = self.build_surject_anchors_multi(graph_alignment_gaf, targets)
+        requests, slots = [], []
+        out: List[Tuple[str, str, List[str]]] = []
+        for t, (anchors, path_len, status) in zip(targets, built):
+            if not anchors:
+                out.append((t, f"no_anchors ({status})", []))
+                continue
+            slots.append(len(out))
+            out.append((t, "ok", []))
+            requests.append((graph_alignment_gaf, anchors, t, path_len))
+        for slot, lines in zip(slots, self._giraffe.surject_with_anchors_batch(requests)):
+            t, status, _ = out[slot]
+            out[slot] = (t, status, lines)
+        return out
+
     def surject_sequence(
         self,
         sequence: str,

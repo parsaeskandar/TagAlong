@@ -2442,6 +2442,50 @@ Index::translate_sri(const std::string& src_haplotype,
     return out;
 }
 
+namespace {
+
+/// Gaf mappings -> the subset the .sri anchor builder reads.
+std::vector<srianchor::SourceMapping>
+to_sri_mappings(const std::vector<panindexer::SourceMapping>& src) {
+    std::vector<srianchor::SourceMapping> out;
+    out.reserve(src.size());
+    for (const auto& m : src) {
+        srianchor::SourceMapping sm;
+        sm.node_id = m.node_id;
+        sm.is_reverse = m.is_reverse;
+        sm.read_begin_offset = m.read_begin_offset;
+        sm.read_end_offset = m.read_end_offset;
+        out.push_back(sm);
+    }
+    return out;
+}
+
+/// One target's anchors -> the Python-facing record. Shared by the single- and
+/// multi-target paths so their output cannot drift apart.
+void fill_anchor_result(const std::vector<srianchor::Anchor>& anchors, size_t best_pid,
+                        const gbwt::SequenceLocate& sri, AnchorBuildPyResult& out) {
+    if (anchors.empty()) { out.status = "no_common_nodes"; return; }
+    out.anchors.reserve(anchors.size());
+    for (const srianchor::Anchor& a : anchors) {
+        AnchorRecord r;
+        r.source_mapping_begin = a.source_mapping;
+        r.source_mapping_end   = a.source_mapping + 1;
+        r.read_begin_offset = a.read_begin;
+        r.read_end_offset   = a.read_end;
+        r.path_offset_step_begin = a.path_offset;
+        r.path_offset_step_end   = a.path_offset;
+        r.gbwt_edge_begin_node   = a.edge_node;
+        r.gbwt_edge_begin_offset = a.edge_offset;
+        r.gbwt_edge_end_node     = a.edge_node;
+        r.gbwt_edge_end_offset   = a.edge_offset;
+        out.anchors.push_back(r);
+    }
+    out.target_path_length = sri.sequenceLength(gbwt::Path::encode(best_pid, false));
+    out.status = "ok";
+}
+
+}  // namespace
+
 /// build_surject_anchors() on the .sri.
 AnchorBuildPyResult
 Index::build_surject_anchors_sri(const std::string& gaf_str,
@@ -2453,16 +2497,7 @@ Index::build_surject_anchors_sri(const std::string& gaf_str,
     if (src.empty()) { out.status = "parse_error"; return out; }
     out.n_source_mappings = src.size();
 
-    std::vector<srianchor::SourceMapping> mappings;
-    mappings.reserve(src.size());
-    for (const auto& m : src) {
-        srianchor::SourceMapping sm;
-        sm.node_id = m.node_id;
-        sm.is_reverse = m.is_reverse;
-        sm.read_begin_offset = m.read_begin_offset;
-        sm.read_end_offset = m.read_end_offset;
-        mappings.push_back(sm);
-    }
+    std::vector<srianchor::SourceMapping> mappings = to_sri_mappings(src);
 
     srianchor::Builder builder(*gbz_, *sri_);
     const auto t_resolve = prof_clock::now();
@@ -2480,26 +2515,63 @@ Index::build_surject_anchors_sri(const std::string& gaf_str,
     out.decompress_sa_calls = st.sa_calls;
     out.decompress_sa_entries = st.sa_entries;
     out.target_rev_strand = st.reverse_strand;
+    fill_anchor_result(anchors, best_pid, *sri_, out);
+    return out;
+}
 
-    if (anchors.empty()) { out.status = "no_common_nodes"; return out; }
-
-    out.anchors.reserve(anchors.size());
-    for (const srianchor::Anchor& a : anchors) {
-        AnchorRecord r;
-        r.source_mapping_begin = a.source_mapping;
-        r.source_mapping_end   = a.source_mapping + 1;
-        r.read_begin_offset = a.read_begin;
-        r.read_end_offset   = a.read_end;
-        r.path_offset_step_begin = a.path_offset;
-        r.path_offset_step_end   = a.path_offset;
-        r.gbwt_edge_begin_node   = a.edge_node;
-        r.gbwt_edge_begin_offset = a.edge_offset;
-        r.gbwt_edge_end_node     = a.edge_node;
-        r.gbwt_edge_end_offset   = a.edge_offset;
-        out.anchors.push_back(r);
+/// build_surject_anchors() for many targets in one pass: one decompressSA per
+/// distinct read node serves every target. Result i is what
+/// build_surject_anchors(gaf, targets[i]) returns.
+std::vector<AnchorBuildPyResult>
+Index::build_surject_anchors_multi(const std::string& gaf_str,
+                                   const std::vector<std::string>& targets) const {
+    if (!loaded_) {
+        throw std::runtime_error("Index::build_surject_anchors_multi called before load()");
     }
-    out.target_path_length = sri_->sequenceLength(gbwt::Path::encode(best_pid, false));
-    out.status = "ok";
+    static const bool no_sri_env = (std::getenv("PANGENOME_NO_SRI") != nullptr);
+    if (!have_sri_ || no_sri_env) {
+        // The tag-array builder has no shared pass; one call per target.
+        std::vector<AnchorBuildPyResult> out;
+        out.reserve(targets.size());
+        for (const std::string& t : targets) out.push_back(build_surject_anchors(gaf_str, t));
+        return out;
+    }
+
+    std::vector<AnchorBuildPyResult> out(targets.size());
+    const auto t_parse = prof_clock::now();
+    auto src = gaf_to_source_mappings(gaf_str, gbz_->graph);
+    const double parse_ms = ms_since(t_parse);
+    if (src.empty()) {
+        for (auto& r : out) { r.status = "parse_error"; r.parse_ms = parse_ms; }
+        return out;
+    }
+    std::vector<srianchor::SourceMapping> mappings = to_sri_mappings(src);
+
+    srianchor::Builder builder(*gbz_, *sri_);
+    const auto t_resolve = prof_clock::now();
+    std::vector<std::vector<size_t>> pids = builder.resolve_many(targets);
+    const double resolve_ms = ms_since(t_resolve);
+
+    const auto t_build = prof_clock::now();
+    srianchor::Stats st;
+    std::vector<srianchor::TargetResult> res = builder.build_multi(mappings, pids, st);
+    const double build_ms = ms_since(t_build);
+
+    for (size_t i = 0; i < targets.size(); i++) {
+        AnchorBuildPyResult& r = out[i];
+        // Timings and index work are for the WHOLE shared pass, not per target.
+        r.parse_ms = parse_ms;
+        r.resolve_ms = resolve_ms;
+        r.build_ms = build_ms;
+        r.decompress_sa_calls = st.sa_calls;
+        r.decompress_sa_entries = st.sa_entries;
+        r.n_source_mappings = src.size();
+        r.n_target_subpaths = pids[i].size();
+        if (pids[i].empty()) { r.status = "unknown_path"; continue; }
+        r.n_touched_subpaths = res[i].touched_paths;
+        r.target_rev_strand = res[i].reverse_strand;
+        fill_anchor_result(res[i].anchors, res[i].best_pid, *sri_, r);
+    }
     return out;
 }
 

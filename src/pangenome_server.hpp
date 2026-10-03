@@ -288,6 +288,13 @@ public:
     AnchorBuildPyResult
     build_surject_anchors_sri(const std::string& gaf_str,
                               const std::string& target_haplotype) const;
+
+    /// build_surject_anchors() for many targets in ONE pass over the read's
+    /// nodes. Result i is what build_surject_anchors(gaf, targets[i]) returns;
+    /// timings and decompressSA counts describe the shared pass.
+    std::vector<AnchorBuildPyResult>
+    build_surject_anchors_multi(const std::string& gaf_str,
+                                const std::vector<std::string>& targets) const;
     std::vector<HaplotypeCoverage>
     translatable_haplotypes_scored_sri(const std::string& src_haplotype,
                                        int64_t start, int64_t end,
