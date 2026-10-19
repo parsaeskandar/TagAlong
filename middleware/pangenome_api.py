@@ -499,6 +499,9 @@ class Service:
         haplotypes = []
         for c, (t, status, sj) in zip(chosen, results):
             rec = _alignment_record(t, status, sj, qstart, qend)
+            # Always present, so a client can key every record -- ok or not --
+            # by the name it asked about. "haplotype" is the exact path landed on.
+            rec["requested"] = t
             # The haplotype's graph-level scores, next to its surjection. The
             # record's own "identity" is the SURJECTED alignment's.
             rec["coverage"] = c["coverage"]
