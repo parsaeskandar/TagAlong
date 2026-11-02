@@ -73,6 +73,66 @@ struct Stats {
     double ms               = 0.0;
 };
 
+/// Every GBWT path's name parts, indexed once at load so that resolving a name
+/// or naming a block needs no scan of the metadata.
+struct PathCatalog {
+    std::vector<size_t>   offset;            ///< path id -> its offset on the contig
+    std::vector<uint32_t> contig, hap;       ///< path id -> index into contigs / haps
+    std::vector<std::string> contigs;        ///< "sample#hap#contig"
+    std::vector<std::string> contig_short;   ///< "contig"
+    std::vector<std::string> haps;           ///< "sample#hap"
+    std::unordered_map<std::string, uint32_t> contig_index, hap_index;
+    std::vector<std::vector<gbwt::size_type>> contig_paths, hap_paths;  ///< ascending path id
+
+    explicit PathCatalog(const gbwt::Metadata& md) {
+        const gbwt::size_type n = md.paths();
+        offset.resize(n); contig.resize(n); hap.resize(n);
+        for (gbwt::size_type pid = 0; pid < n; pid++) {
+            gbwt::FullPathName fp = md.fullPath(pid);
+            const std::string h = fp.sample_name + "#" + std::to_string(fp.haplotype);
+            const std::string c = h + "#" + fp.contig_name;
+            offset[pid] = fp.offset;
+            contig[pid] = intern(c, contig_index, contigs, contig_paths);
+            if (contig[pid] == contig_short.size()) contig_short.push_back(fp.contig_name);
+            hap[pid] = intern(h, hap_index, haps, hap_paths);
+            contig_paths[contig[pid]].push_back(pid);
+            hap_paths[hap[pid]].push_back(pid);
+        }
+    }
+
+    /// Paths named `name`, a contig "sample#hap#contig" or a haplotype "sample#hap".
+    std::vector<gbwt::size_type> resolve(const std::string& name) const {
+        std::vector<gbwt::size_type> out;
+        auto c = contig_index.find(name);
+        if (c != contig_index.end()) out = contig_paths[c->second];
+        auto h = hap_index.find(name);
+        if (h != hap_index.end()) {
+            out.insert(out.end(), hap_paths[h->second].begin(), hap_paths[h->second].end());
+            std::sort(out.begin(), out.end());
+            out.erase(std::unique(out.begin(), out.end()), out.end());
+        }
+        return out;
+    }
+
+private:
+    static uint32_t intern(const std::string& name,
+                           std::unordered_map<std::string, uint32_t>& index,
+                           std::vector<std::string>& names,
+                           std::vector<std::vector<gbwt::size_type>>& paths) {
+        auto it = index.emplace(name, static_cast<uint32_t>(names.size())).first;
+        if (it->second == names.size()) { names.push_back(name); paths.emplace_back(); }
+        return it->second;
+    }
+};
+
+/// A node block named by its target path id rather than a contig string.
+struct PathBlock {
+    gbwt::size_type pid = 0;
+    size_t src_start = 0, src_end = 0;   ///< contig coordinates, half-open
+    size_t tgt_start = 0, tgt_end = 0;
+    char   strand = '+';
+};
+
 /// SCAN calls locateForward on every source node: simple, and every node's
 /// answer comes straight from the index. WALK calls it only until it finds the
 /// target, then follows that target with LF and joins on node identity -- the
@@ -82,12 +142,15 @@ enum class Mode { SCAN, WALK, VERIFY };
 
 class Translator {
 public:
-    Translator(const gbwtgraph::GBZ& gbz, const gbwt::SequenceLocate& sri)
-        : gbz_(gbz), sri_(sri) {}
+    /// With a catalog, name lookups are hash lookups instead of metadata scans.
+    Translator(const gbwtgraph::GBZ& gbz, const gbwt::SequenceLocate& sri,
+               const PathCatalog* catalog = nullptr)
+        : gbz_(gbz), sri_(sri), cat_(catalog) {}
 
     /// Path ids whose (sample, haplotype) match `name`, which may be
     /// "HG02257#1" or a full contig "GRCh38#0#chr8".
     std::vector<gbwt::size_type> resolve(const std::string& name) const {
+        if (cat_) return cat_->resolve(name);
         std::vector<gbwt::size_type> out;
         const gbwt::Metadata& md = gbz_.index.metadata;
         for (gbwt::size_type pid = 0; pid < md.paths(); pid++) {
@@ -106,10 +169,9 @@ public:
         std::vector<gbwt::node_type> nodes;
         if (end <= start) return nodes;
         for (gbwt::size_type src_pid : fragments_for(src_name, start, end)) {
-            gbwt::FullPathName fp = gbz_.index.metadata.fullPath(src_pid);
             const gbwt::size_type src_seq = gbwt::Path::encode(src_pid, false);
             const size_t frag_len = sri_.sequenceLength(src_seq);
-            const size_t frag_off = fp.offset;
+            const size_t frag_off = path_offset(src_pid);
             const size_t lo = (start > frag_off) ? (start - frag_off) : 0;
             const size_t hi = std::min(end - frag_off, frag_len);
             if (lo >= hi) continue;
@@ -131,6 +193,7 @@ public:
     }
 
     std::string contig_name(gbwt::size_type path_id) const {
+        if (cat_) return cat_->contigs[cat_->contig[path_id]];
         gbwt::FullPathName fp = gbz_.index.metadata.fullPath(path_id);
         return fp.sample_name + "#" + std::to_string(fp.haplotype) + "#" + fp.contig_name;
     }
@@ -150,10 +213,9 @@ public:
         // A contig is split into several GBWT paths; walk the ones the interval
         // touches, in contig order.
         for (gbwt::size_type src_pid : fragments_for(src_name, start, end)) {
-            gbwt::FullPathName fp = gbz_.index.metadata.fullPath(src_pid);
             const gbwt::size_type src_seq = gbwt::Path::encode(src_pid, false);
             const size_t frag_len = sri_.sequenceLength(src_seq);
-            const size_t frag_off = fp.offset;
+            const size_t frag_off = path_offset(src_pid);
 
             // Clip the request to this fragment, in fragment-local coordinates.
             const size_t lo = (start > frag_off) ? (start - frag_off) : 0;
@@ -266,9 +328,92 @@ public:
         return out;
     }
 
+    /// SCAN for many targets in one pass: every visit at every source node
+    /// becomes a block for its path when want[path id] is set. Blocks that
+    /// continue the path's previous block are merged on arrival. Returns one
+    /// group per path, in first-seen order. Stops at `deadline` (if set) and
+    /// reports it through *timed_out.
+    std::vector<std::vector<PathBlock>> scan(
+            const std::string& src_name, size_t start, size_t end,
+            const std::vector<char>& want, Stats& st,
+            std::chrono::steady_clock::time_point deadline, bool* timed_out) const {
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<std::vector<PathBlock>> groups;
+        std::unordered_map<gbwt::size_type, size_t> slot;
+        if (timed_out) *timed_out = false;
+        const bool has_deadline = deadline != std::chrono::steady_clock::time_point{};
+        if (end <= start) return groups;
+
+        for (gbwt::size_type src_pid : fragments_for(src_name, start, end)) {
+            const gbwt::size_type src_seq = gbwt::Path::encode(src_pid, false);
+            const size_t frag_len = sri_.sequenceLength(src_seq);
+            const size_t frag_off = path_offset(src_pid);
+            const size_t lo = (start > frag_off) ? (start - frag_off) : 0;
+            const size_t hi = std::min(end - frag_off, frag_len);
+            if (lo >= hi) continue;
+            st.fragments++;
+
+            gbwt::edge_type gpos;
+            gbwt::edge_type base = sri_.locateSequence(src_seq, lo, gpos);
+            st.locate_sequence++;
+            if (base == gbwt::invalid_edge() || gpos == gbwt::invalid_edge()) continue;
+            size_t node_start = lo - base.second;
+
+            while (gpos.first != gbwt::ENDMARKER && node_start < hi) {
+                if (has_deadline && (st.nodes_walked & 63) == 0 &&
+                    std::chrono::steady_clock::now() > deadline) {
+                    if (timed_out) *timed_out = true;
+                    st.ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count();
+                    return groups;
+                }
+                const gbwt::node_type node = gpos.first;
+                const size_t L = node_len(node);
+                st.nodes_walked++;
+                // Queried in the source's orientation, as in translate(): a
+                // reverse sequence among the hits is an inverted visit.
+                gbwt::size_type first = gbwt::SequenceLocate::NO_POSITION;
+                gbwt::SearchState state = sri_.find(node, first);
+                st.locate_forward++;
+                if (!state.empty()) {
+                    auto hits = sri_.locateForward(state, first);
+                    st.visits_enumerated += hits.size();
+                    for (const auto& h : hits) {
+                        const gbwt::size_type pid = gbwt::Path::id(h.first);
+                        if (pid == src_pid || (!want.empty() && !want[pid])) continue;
+                        PathBlock b;
+                        if (!clip(b, pid, h.first, h.second, L, node_start, frag_off, lo, hi,
+                                  gbwt::Path::is_reverse(h.first))) continue;
+                        auto it = slot.emplace(pid, groups.size()).first;
+                        if (it->second == groups.size()) groups.emplace_back();
+                        append(groups[it->second], b);
+                        st.blocks++;
+                    }
+                }
+                advance(gpos, node_start, L);
+            }
+        }
+        st.ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        return groups;
+    }
+
 private:
     const gbwtgraph::GBZ& gbz_;
     const gbwt::SequenceLocate& sri_;
+    const PathCatalog* cat_ = nullptr;
+
+    /// Append b, or extend one of the last two blocks if b continues it with
+    /// the same offset (two copies on one path alternate, hence two).
+    static void append(std::vector<PathBlock>& g, const PathBlock& b) {
+        for (size_t k = g.size(); k > 0 && k + 2 > g.size(); k--) {
+            PathBlock& p = g[k - 1];
+            if (p.strand != b.strand || p.src_end != b.src_start) continue;
+            if (b.strand == '+' && p.tgt_end == b.tgt_start) { p.src_end = b.src_end; p.tgt_end = b.tgt_end; return; }
+            if (b.strand == '-' && b.tgt_end == p.tgt_start) { p.src_end = b.src_end; p.tgt_start = b.tgt_start; return; }
+        }
+        g.push_back(b);
+    }
 
     /// Emit one node's correspondence, CLIPPED to the requested interval.
     /// A node is a whole unit in the index but the request is arbitrary, so the
@@ -280,10 +425,26 @@ private:
               gbwt::size_type pid, gbwt::size_type seq, size_t fwd_start,
               size_t L, size_t node_start, size_t frag_off,
               size_t lo, size_t hi, bool inverted) const {
+        PathBlock pb;
+        if (!clip(pb, pid, seq, fwd_start, L, node_start, frag_off, lo, hi, inverted)) return;
+        Block b;
+        b.target_contig = contig_name(pid);
+        b.tgt_path_id   = pid;
+        b.src_start = pb.src_start; b.src_end = pb.src_end;
+        b.tgt_start = pb.tgt_start; b.tgt_end = pb.tgt_end;
+        b.strand    = pb.strand;
+        out.push_back(b);
+        st.blocks++;
+    }
+
+    /// emit()'s block without the name; false if the clip leaves nothing.
+    bool clip(PathBlock& b, gbwt::size_type pid, gbwt::size_type seq, size_t fwd_start,
+              size_t L, size_t node_start, size_t frag_off,
+              size_t lo, size_t hi, bool inverted) const {
         size_t s0 = node_start, s1 = node_start + L;          // fragment coords
         const size_t cut_front = (lo > s0) ? (lo - s0) : 0;
         const size_t cut_back  = (s1 > hi) ? (s1 - hi) : 0;
-        if (cut_front + cut_back >= L) return;                // nothing left
+        if (cut_front + cut_back >= L) return false;          // nothing left
         s0 += cut_front; s1 -= cut_back;
 
         const bool rev  = gbwt::Path::is_reverse(seq);
@@ -295,15 +456,16 @@ private:
         if (inverted) { t0 += cut_back;  t1 -= cut_front; }   // mirrored
         else          { t0 += cut_front; t1 -= cut_back;  }
 
-        gbwt::FullPathName tfp = gbz_.index.metadata.fullPath(pid);
-        Block b;
-        b.target_contig = contig_name(pid);
-        b.tgt_path_id   = pid;
+        const size_t toff = path_offset(pid);
+        b.pid = pid;
         b.src_start = frag_off + s0;  b.src_end = frag_off + s1;
-        b.tgt_start = tfp.offset + t0; b.tgt_end = tfp.offset + t1;
+        b.tgt_start = toff + t0;      b.tgt_end = toff + t1;
         b.strand    = inverted ? '-' : '+';
-        out.push_back(b);
-        st.blocks++;
+        return true;
+    }
+
+    size_t path_offset(gbwt::size_type pid) const {
+        return cat_ ? cat_->offset[pid] : gbz_.index.metadata.fullPath(pid).offset;
     }
 
     size_t node_len(gbwt::node_type node) const {
@@ -475,6 +637,17 @@ private:
     std::vector<gbwt::size_type> fragments_for(const std::string& src_name,
                                                size_t start, size_t end) const {
         std::vector<std::pair<size_t, gbwt::size_type>> hits;
+        if (cat_) {
+            for (gbwt::size_type pid : cat_->resolve(src_name)) {
+                const size_t off = cat_->offset[pid];
+                const size_t flen = sri_.sequenceLength(gbwt::Path::encode(pid, false));
+                if (off < end && start < off + flen) hits.emplace_back(off, pid);
+            }
+            std::sort(hits.begin(), hits.end());
+            std::vector<gbwt::size_type> out;
+            for (const auto& h : hits) out.push_back(h.second);
+            return out;
+        }
         const gbwt::Metadata& md = gbz_.index.metadata;
         for (gbwt::size_type pid = 0; pid < md.paths(); pid++) {
             if (!path_matches(pid, src_name)) continue;

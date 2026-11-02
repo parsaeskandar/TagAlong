@@ -2,6 +2,7 @@
 #include "pangenome_index/sampled_tag_array.hpp"
 #include "pangenome_index/translation_tables.hpp"
 #include "pangenome_index/surject_anchor_builder.hpp"
+#include "pangenome_index/lift_fold.hpp"
 #include <sdsl/wavelet_trees.hpp>
 #include <sdsl/simple_sds.hpp>
 #include <gbwt/gbwt.h>
@@ -17,6 +18,7 @@
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
+#include <map>
 #include <set>
 #include <stdexcept>
 #include <algorithm>
@@ -566,6 +568,7 @@ void Index::load(const std::string& gbz_path,
                 std::to_string(gbz_->index.sequences()) + " sequences)");
         }
         have_sri_ = true;
+        path_catalog_ = std::make_shared<const seqtrans::PathCatalog>(gbz_->index.metadata);
         log_step("[3b]   loaded");
     }
 
@@ -2324,7 +2327,7 @@ Index::translatable_haplotypes_scored_sri(const std::string& src_haplotype,
             " exceeds maximum of " + std::to_string(MAX_INTERVAL_LENGTH) + " bases");
     }
 
-    seqtrans::Translator tr(*gbz_, *sri_);
+    seqtrans::Translator tr(*gbz_, *sri_, path_catalog_.get());
     seqtrans::Stats st;
     std::vector<gbwt::node_type> nodes = tr.source_nodes(
         src_haplotype, static_cast<size_t>(start), static_cast<size_t>(end), st);
@@ -2416,7 +2419,7 @@ Index::translate_sri(const std::string& src_haplotype,
     std::vector<TranslatedInterval> out;
     if (start < 0 || end <= start) return out;
 
-    seqtrans::Translator tr(*gbz_, *sri_);
+    seqtrans::Translator tr(*gbz_, *sri_, path_catalog_.get());
     std::vector<gbwt::size_type> tgt_ids = tr.resolve(tgt_haplotype);
     if (tgt_ids.empty()) return out;
 
@@ -2438,6 +2441,176 @@ Index::translate_sri(const std::string& src_haplotype,
             ti.strand = b.strand;
             out.push_back(ti);
         }
+    }
+    return out;
+}
+
+struct Index::LiftGroup {
+    std::string contig;
+    std::vector<liftfold::Run> runs;
+};
+
+namespace {
+
+/// A block's correspondences as a run, the way translate_sri() expands them.
+liftfold::Run block_run(size_t s0, size_t s1, size_t t0, size_t t1, char strand) {
+    liftfold::Run r;
+    r.s0 = static_cast<int64_t>(s0);
+    r.n = static_cast<int64_t>(s1 - s0);
+    r.d = strand == '-' ? -1 : 1;
+    r.t0 = strand == '-' ? static_cast<int64_t>(t1) - 1 : static_cast<int64_t>(t0);
+    return r;
+}
+
+/// From this many targets, one SCAN pass beats a WALK per target.
+constexpr size_t LIFT_SCAN_MIN_TARGETS = 8;
+
+/// Fold each group and sort the pieces the way the API always has.
+std::vector<LiftPiece> fold_groups(std::vector<Index::LiftGroup>& groups, bool blocks) {
+    std::vector<LiftPiece> out;
+    for (auto& g : groups) {
+        for (const liftfold::Piece& p : liftfold::fold(std::move(g.runs),
+                 blocks ? liftfold::Kind::BLOCKS : liftfold::Kind::INTERVALS)) {
+            out.push_back({g.contig, p.source_start, p.source_end,
+                           p.target_start, p.target_end, p.strand});
+        }
+    }
+    std::stable_sort(out.begin(), out.end(), [blocks](const LiftPiece& a, const LiftPiece& b) {
+        if (a.haplotype != b.haplotype) return a.haplotype < b.haplotype;
+        if (blocks) return a.source_start < b.source_start;
+        return a.target_start != b.target_start ? a.target_start < b.target_start
+                                                : a.target_end < b.target_end;
+    });
+    return out;
+}
+
+}  // namespace
+
+std::vector<std::vector<Index::LiftGroup>>
+Index::lift_groups(const std::string& src_haplotype, int64_t start, int64_t end,
+                   const std::vector<std::string>& targets, double timeout_ms,
+                   std::vector<std::string>& timed_out) const {
+    if (!loaded_) throw std::runtime_error("Index::lift called before load()");
+    if (start < 0 || end < start) {
+        throw std::invalid_argument("Invalid interval [" + std::to_string(start) +
+                                    ", " + std::to_string(end) + "]");
+    }
+    if (end - start > MAX_INTERVAL_LENGTH) {
+        throw std::invalid_argument("Interval length " + std::to_string(end - start) +
+            " exceeds maximum of " + std::to_string(MAX_INTERVAL_LENGTH) + " bases");
+    }
+    std::vector<std::vector<LiftGroup>> out(targets.size());
+
+    static const bool no_sri_env = (std::getenv("PANGENOME_NO_SRI") != nullptr);
+    if (have_sri_ && !no_sri_env) {
+        seqtrans::Translator tr(*gbz_, *sri_, path_catalog_.get());
+        seqtrans::Stats st;
+        if (targets.size() < LIFT_SCAN_MIN_TARGETS) {
+            for (size_t i = 0; i < targets.size(); i++) {
+                std::vector<gbwt::size_type> ids = tr.resolve(targets[i]);
+                if (ids.empty()) continue;
+                std::unordered_map<size_t, size_t> slot;
+                for (const seqtrans::Block& b : tr.translate(src_haplotype,
+                         static_cast<size_t>(start), static_cast<size_t>(end), ids, st,
+                         seqtrans::Mode::WALK)) {
+                    auto it = slot.emplace(b.tgt_path_id, out[i].size()).first;
+                    if (it->second == out[i].size()) out[i].push_back({b.target_contig, {}});
+                    out[i][it->second].runs.push_back(
+                        block_run(b.src_start, b.src_end, b.tgt_start, b.tgt_end, b.strand));
+                }
+            }
+            return out;
+        }
+
+        // One pass for every target: which targets want each path.
+        const size_t npaths = gbz_->index.metadata.paths();
+        std::vector<char> want(npaths, 0);
+        std::vector<int32_t> owner(npaths, -1);
+        std::unordered_map<gbwt::size_type, std::vector<size_t>> more_owners;
+        for (size_t i = 0; i < targets.size(); i++) {
+            for (gbwt::size_type pid : tr.resolve(targets[i])) {
+                want[pid] = 1;
+                if (owner[pid] < 0) owner[pid] = static_cast<int32_t>(i);
+                else if (static_cast<size_t>(owner[pid]) != i) more_owners[pid].push_back(i);
+            }
+        }
+        std::chrono::steady_clock::time_point deadline{};
+        if (timeout_ms > 0) {
+            deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(
+                static_cast<int64_t>(timeout_ms * 1000.0 * targets.size()));
+        }
+        bool expired = false;
+        auto groups = tr.scan(src_haplotype, static_cast<size_t>(start),
+                              static_cast<size_t>(end), want, st, deadline, &expired);
+        if (expired) timed_out = targets;
+        for (const auto& g : groups) {
+            const gbwt::size_type pid = g.front().pid;
+            LiftGroup lg{path_catalog_->contigs[path_catalog_->contig[pid]], {}};
+            lg.runs.reserve(g.size());
+            for (const seqtrans::PathBlock& b : g) {
+                lg.runs.push_back(block_run(b.src_start, b.src_end, b.tgt_start, b.tgt_end, b.strand));
+            }
+            auto extra = more_owners.find(pid);
+            if (extra != more_owners.end()) {
+                for (size_t i : extra->second) out[i].push_back(lg);
+            }
+            out[static_cast<size_t>(owner[pid])].push_back(std::move(lg));
+        }
+        return out;
+    }
+
+    // Tag arrays: per-base correspondences, grouped by (contig, path).
+    for (size_t i = 0; i < targets.size(); i++) {
+        bool expired = false;
+        std::vector<TranslatedInterval> raw =
+            translate(src_haplotype, start, end, targets[i], timeout_ms, &expired);
+        if (expired) timed_out.push_back(targets[i]);
+        std::map<std::pair<std::string, int64_t>, size_t> slot;
+        for (const TranslatedInterval& p : raw) {
+            auto it = slot.emplace(std::make_pair(p.haplotype, p.target_path_id), out[i].size()).first;
+            if (it->second == out[i].size()) out[i].push_back({p.haplotype, {}});
+            out[i][it->second].runs.push_back({p.start, p.end, 1, 1});
+        }
+    }
+    return out;
+}
+
+LiftRun Index::lift(const std::string& src_haplotype, int64_t start, int64_t end,
+                    const std::vector<std::string>& targets, bool blocks,
+                    double timeout_ms) const {
+    LiftRun run;
+    for (auto& groups : lift_groups(src_haplotype, start, end, targets, timeout_ms, run.timed_out)) {
+        std::vector<LiftPiece> pieces = fold_groups(groups, blocks);
+        run.pieces.insert(run.pieces.end(), pieces.begin(), pieces.end());
+    }
+    return run;
+}
+
+std::vector<LiftSummary>
+Index::lift_summary(const std::string& src_haplotype, int64_t start, int64_t end,
+                    const std::vector<std::string>& targets, double timeout_ms,
+                    bool* timed_out) const {
+    std::vector<std::string> expired;
+    auto per_target = lift_groups(src_haplotype, start, end, targets, timeout_ms, expired);
+    if (timed_out) *timed_out = !expired.empty();
+    std::vector<LiftSummary> out(targets.size());
+    for (size_t i = 0; i < targets.size(); i++) {
+        LiftSummary& s = out[i];
+        s.haplotype = targets[i];
+        // Source bases covered: the union of every correspondence's source range.
+        std::vector<std::pair<int64_t, int64_t>> ranges;
+        for (const auto& g : per_target[i]) {
+            for (const auto& r : g.runs) ranges.emplace_back(r.s0, r.s0 + r.n);
+        }
+        std::sort(ranges.begin(), ranges.end());
+        int64_t covered_to = INT64_MIN;
+        for (const auto& r : ranges) {
+            if (r.first >= covered_to) s.mapped_bp += r.second - r.first;
+            else if (r.second > covered_to) s.mapped_bp += r.second - covered_to;
+            covered_to = std::max(covered_to, r.second);
+        }
+        if (!ranges.empty()) { s.source_start = ranges.front().first; s.source_end = covered_to; }
+        s.pieces = fold_groups(per_target[i], false);
     }
     return out;
 }

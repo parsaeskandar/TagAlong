@@ -14,6 +14,8 @@
 #include <vector>
 #include <unordered_map>
 
+namespace seqtrans { struct PathCatalog; }
+
 /// How much of one alignment a single haplotype accounts for.
 ///
 /// Unlike the engine's "carried by" list — which reports only haplotypes that
@@ -61,6 +63,31 @@ struct TranslatedInterval {
     ///
     /// -1 when unset, so a consumer built against the older struct still works.
     int64_t target_path_id = -1;
+};
+
+/// One folded piece of a translation: a target interval, or a chain block.
+/// Both sides half-open; target_start < target_end whatever the strand.
+struct LiftPiece {
+    std::string haplotype;      ///< target contig, "sample#hap#contig"
+    int64_t source_start = 0, source_end = 0;
+    int64_t target_start = 0, target_end = 0;
+    char strand = '+';
+};
+
+/// lift()'s result: the pieces for every target, target by target, and the
+/// targets abandoned at the deadline (their pieces may be incomplete).
+struct LiftRun {
+    std::vector<LiftPiece> pieces;
+    std::vector<std::string> timed_out;
+};
+
+/// Where a source interval lands on one target haplotype, in brief.
+struct LiftSummary {
+    std::string haplotype;              ///< the target as requested, e.g. "HG00097#1"
+    std::vector<LiftPiece> pieces;      ///< folded intervals, as lift() returns them
+    uint64_t mapped_bp = 0;             ///< source bases with a correspondence here
+    int64_t source_start = -1;          ///< covered source range; -1 when none
+    int64_t source_end = -1;
 };
 
 /// Per-source-fragment accounting for one translation, so it is possible to see
@@ -319,6 +346,27 @@ public:
               double timeout_ms = 0.0,
               bool* timed_out = nullptr) const;
 
+    /// Translate to each of `targets` and fold the result into target intervals
+    /// (or chain blocks when `blocks`), as the API returns them. Pieces come
+    /// target by target, each target's sorted by contig and position. With a
+    /// .sri and many targets this is one pass over the source nodes for all of
+    /// them. `timeout_ms` is per target; the single pass gets the sum.
+    /// One alignment to fold: a target contig and its correspondences.
+    struct LiftGroup;
+
+    LiftRun lift(const std::string& src_haplotype, int64_t start, int64_t end,
+                 const std::vector<std::string>& targets, bool blocks,
+                 double timeout_ms = 0.0) const;
+
+    /// lift() reduced to a summary per target: its intervals, how many source
+    /// bases it covers, and the covered source range. One entry per target,
+    /// in order, including targets the interval does not reach.
+    std::vector<LiftSummary> lift_summary(const std::string& src_haplotype,
+                                          int64_t start, int64_t end,
+                                          const std::vector<std::string>& targets,
+                                          double timeout_ms = 0.0,
+                                          bool* timed_out = nullptr) const;
+
     /// Discovery query: for a source contig interval, return the set of target
     /// haplotype names (2-field) that have a homologous region overlapping it —
     /// i.e. every haplotype this interval CAN be translated to. This is a pure
@@ -447,6 +495,15 @@ private:
     bool has_table2_ = false;
     std::unique_ptr<gbwt::SequenceLocate> sri_;
     bool have_sri_ = false;
+    /// Path names indexed for the .sri translator; built at load with the .sri.
+    std::shared_ptr<const seqtrans::PathCatalog> path_catalog_;
+
+    /// Each target's alignments, in first-seen order (shared by lift and lift_summary).
+    std::vector<std::vector<LiftGroup>> lift_groups(const std::string& src_haplotype,
+                                                    int64_t start, int64_t end,
+                                                    const std::vector<std::string>& targets,
+                                                    double timeout_ms,
+                                                    std::vector<std::string>& timed_out) const;
     /// Haplotype names, cached at load(): deriving them walks every GBWT path.
     std::vector<std::string> haplotype_names_;
     std::unordered_map<size_t, std::pair<std::string, size_t>> path_to_global_;
