@@ -26,6 +26,7 @@ from __future__ import annotations
 import contextlib
 import os
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -348,6 +349,31 @@ class PangenomeMiddleware:
         self-identifying via its contig name.
         """
         out: List[Dict[str, Any]] = []
+        lift = getattr(self._coord, "lift", None)
+        if lift is not None:
+            # One C++ call folds every target (and shares one pass over the
+            # source nodes when there are many), with the GIL released.
+            t0 = time.perf_counter()
+            with self._coord_lock:
+                run = lift(src, int(start), int(end), list(tgts), bool(blocks),
+                           float(timeout_ms or 0.0))
+            elapsed = round((time.perf_counter() - t0) * 1000, 1)
+            if warnings is not None:
+                for tgt in run.timed_out:
+                    warnings.append({
+                        "haplotype": tgt, "reason": "timeout", "elapsed_ms": elapsed,
+                        "message": (f"Translation to {tgt} exceeded {int(timeout_ms)} ms "
+                                    "and was stopped; results for it may be incomplete."),
+                    })
+            if blocks:
+                return [{"haplotype": p.haplotype,
+                         "source_start": p.source_start, "source_end": p.source_end,
+                         "target_start": p.target_start, "target_end": p.target_end,
+                         "strand": p.strand} for p in run.pieces]
+            return [{"haplotype": p.haplotype, "start": p.target_start,
+                     "end": p.target_end, "strand": p.strand} for p in run.pieces]
+
+        # Extension without lift(): translate per target and fold here.
         checked = getattr(self._coord, "translate_checked", None)
         with self._coord_lock:
             for tgt in tgts:
@@ -369,6 +395,40 @@ class PangenomeMiddleware:
                     raw = self._coord.translate(src, int(start), int(end), tgt)
                 out.extend(_fold_to_blocks(raw) if blocks else _fold_to_intervals(raw))
         return out
+
+    def translate_summary(
+        self, src: str, start: int, end: int, tgts: Sequence[str],
+        timeout_ms: float = 5000.0,
+        warnings: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Where a source interval lands on each target, in brief: one entry per
+        target, in order, including targets it does not reach.
+
+        Each entry is {haplotype, pieces, mapped_bp, source_covered}: `pieces`
+        are the target intervals {contig, start, end, strand, source_start,
+        source_end}; `mapped_bp` counts source bases with a correspondence;
+        `source_covered` is [first, last) of those bases, or None."""
+        fn = getattr(self._coord, "lift_summary", None)
+        if fn is None:
+            raise RuntimeError("liftover_ext predates lift_summary; rebuild it")
+        t0 = time.perf_counter()
+        with self._coord_lock:
+            rows, timed_out = fn(src, int(start), int(end), list(tgts), float(timeout_ms or 0.0))
+        if timed_out and warnings is not None:
+            warnings.append({
+                "haplotype": "*", "reason": "timeout",
+                "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
+                "message": "The translation was stopped at its deadline; summaries may be incomplete.",
+            })
+        return [{"haplotype": r.haplotype,
+                 "pieces": [{"contig": p.haplotype.split("#", 2)[-1],
+                             "start": p.target_start, "end": p.target_end, "strand": p.strand,
+                             "source_start": p.source_start, "source_end": p.source_end}
+                            for p in r.pieces],
+                 "mapped_bp": int(r.mapped_bp),
+                 "source_covered": ([r.source_start, r.source_end]
+                                    if r.source_start >= 0 else None)}
+                for r in rows]
 
     def translatable_haplotypes_scored(self, src: str, start: int, end: int,
                                        min_coverage: float = 0.0,

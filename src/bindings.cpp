@@ -24,6 +24,33 @@ PYBIND11_MODULE(liftover_ext, m) {
                    " strand=" + std::string(1, ti.strand) + ">";
         });
 
+    py::class_<LiftPiece>(m, "LiftPiece")
+        .def(py::init<>())
+        .def_readwrite("haplotype",    &LiftPiece::haplotype)
+        .def_readwrite("source_start", &LiftPiece::source_start)
+        .def_readwrite("source_end",   &LiftPiece::source_end)
+        .def_readwrite("target_start", &LiftPiece::target_start)
+        .def_readwrite("target_end",   &LiftPiece::target_end)
+        .def_readwrite("strand",       &LiftPiece::strand)
+        .def("__repr__", [](const LiftPiece& p) {
+            return "<LiftPiece " + p.haplotype + ":" + std::to_string(p.target_start) + "-" +
+                   std::to_string(p.target_end) + std::string(1, p.strand) + " from " +
+                   std::to_string(p.source_start) + "-" + std::to_string(p.source_end) + ">";
+        });
+
+    py::class_<LiftRun>(m, "LiftRun")
+        .def(py::init<>())
+        .def_readwrite("pieces",    &LiftRun::pieces)
+        .def_readwrite("timed_out", &LiftRun::timed_out);
+
+    py::class_<LiftSummary>(m, "LiftSummary")
+        .def(py::init<>())
+        .def_readwrite("haplotype",    &LiftSummary::haplotype)
+        .def_readwrite("pieces",       &LiftSummary::pieces)
+        .def_readwrite("mapped_bp",    &LiftSummary::mapped_bp)
+        .def_readwrite("source_start", &LiftSummary::source_start)
+        .def_readwrite("source_end",   &LiftSummary::source_end);
+
     py::register_exception_translator([](std::exception_ptr p) {
         try {
             if (p) std::rethrow_exception(p);
@@ -262,6 +289,30 @@ PYBIND11_MODULE(liftover_ext, m) {
              "translate() with a deadline. Returns TranslationRun(intervals, "
              "timed_out, elapsed_ms); a target that exceeds timeout_ms is "
              "abandoned instead of stalling the request.")
+        .def("lift", &Index::lift,
+             py::call_guard<py::gil_scoped_release>(),
+             py::arg("src_haplotype"), py::arg("start"), py::arg("end"),
+             py::arg("targets"), py::arg("blocks") = false, py::arg("timeout_ms") = 0.0,
+             "Translate to every target and fold into intervals (or chain blocks "
+             "when blocks=True), as /api/v1/liftover returns them. Returns "
+             "LiftRun(pieces, timed_out). Many targets share one pass over the "
+             "source nodes.")
+        .def("lift_summary",
+             [](const Index& self, const std::string& src, int64_t start, int64_t end,
+                const std::vector<std::string>& targets, double timeout_ms) {
+                 bool timed_out = false;
+                 std::vector<LiftSummary> rows;
+                 {
+                     py::gil_scoped_release release;
+                     rows = self.lift_summary(src, start, end, targets, timeout_ms, &timed_out);
+                 }
+                 return std::make_pair(rows, timed_out);
+             },
+             py::arg("src_haplotype"), py::arg("start"), py::arg("end"),
+             py::arg("targets"), py::arg("timeout_ms") = 0.0,
+             "Per-target summary of a translation: (rows, timed_out), one "
+             "LiftSummary(haplotype, pieces, mapped_bp, source_start, source_end) "
+             "per target, in order.")
         .def("get_haplotype_names", &Index::get_haplotype_names,
              "Return list of valid haplotype names in the loaded index.")
         .def("haplotype_coverage", &Index::haplotype_coverage,

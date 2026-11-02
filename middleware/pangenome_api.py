@@ -36,6 +36,11 @@ Endpoints:
       optional "blocks": true -> returns "blocks" instead of "intervals": the full
       colinear block alignment {haplotype, source_start, source_end, target_start,
       target_end, strand}, preserving exon/indel structure
+      optional "summary": true -> returns "summary" instead: one entry per target
+      {haplotype, pieces:[{contig, start, end, strand, source_start, source_end}],
+       mapped_bp, source_covered:[start, end] | null}, including targets not reached
+      "tgt": "*" means every haplotype; many targets share one pass over the
+      source, so all of them cost about as much as a few
   POST /api/v1/liftover/targets {src, start, end}   (synchronous, names only)
       -> 200 {haplotypes:[...]}   haplotypes this source interval CAN translate to
   GET  /api/v1/haplotypes     -> 200 {haplotypes:[...]}   (2-field names)
@@ -454,6 +459,17 @@ class Service:
         return self._mw.translate_intervals(src, start, end, tgts,
                                            timeout_ms=timeout_ms,
                                            warnings=warnings, blocks=blocks)
+
+    def liftover_summary(self, src: str, start: int, end: int, tgts: List[str],
+                         timeout_ms: float = DEFAULT_LIFTOVER_TIMEOUT_MS,
+                         warnings: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+        """Per-target summary of a translation; see translate_summary."""
+        if not self._ready:
+            raise NotReady()
+        if self._stub:
+            return []
+        return self._mw.translate_summary(src, start, end, tgts,
+                                          timeout_ms=timeout_ms, warnings=warnings)
 
     def resurject(self, tgt: str, job_id: str = "", name: str = "",
                   index: int = 0, gaf: str = "") -> Dict[str, Any]:
@@ -905,7 +921,14 @@ def make_handler(service: Service, cfg: ApiConfig):
                 service.metrics.inc("rejected_400")
                 self._error(400, f"interval length {end - start} exceeds maximum of {MAX_LIFTOVER_SPAN}")
                 return
-            if isinstance(tgt, str):
+            if tgt == "*":
+                try:
+                    tgts = service.haplotypes()
+                except NotReady:
+                    service.metrics.inc("rejected_503")
+                    self._error(503, "service starting; indexes not loaded yet")
+                    return
+            elif isinstance(tgt, str):
                 tgts = [tgt] if tgt else []
             elif isinstance(tgt, list):
                 tgts = tgt
@@ -930,10 +953,19 @@ def make_handler(service: Service, cfg: ApiConfig):
             timeout_ms = max(0.0, min(timeout_ms, MAX_LIFTOVER_TIMEOUT_MS))
 
             want_blocks = bool(payload.get("blocks", False))
+            want_summary = bool(payload.get("summary", False))
+            if want_blocks and want_summary:
+                service.metrics.inc("rejected_400")
+                self._error(400, "'blocks' and 'summary' cannot both be set")
+                return
             warnings: List[Dict[str, Any]] = []
             try:
-                intervals = service.liftover(src, start, end, tgts,
-                                             timeout_ms, warnings, want_blocks)
+                if want_summary:
+                    intervals = service.liftover_summary(src, start, end, tgts,
+                                                         timeout_ms, warnings)
+                else:
+                    intervals = service.liftover(src, start, end, tgts,
+                                                 timeout_ms, warnings, want_blocks)
             except NotReady:
                 service.metrics.inc("rejected_503")
                 self._error(503, "service starting; indexes not loaded yet")
@@ -949,7 +981,7 @@ def make_handler(service: Service, cfg: ApiConfig):
                 self._error(500, f"liftover failed: {exc}")
                 return
 
-            key = "blocks" if want_blocks else "intervals"
+            key = "summary" if want_summary else "blocks" if want_blocks else "intervals"
             self._send_json(200, {key: intervals, "warnings": warnings})
 
         def _handle_surject(self, payload: Dict[str, Any]) -> None:
