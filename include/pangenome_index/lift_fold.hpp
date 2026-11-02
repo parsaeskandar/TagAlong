@@ -6,9 +6,12 @@
 // This is the per-base fold the middleware used to run in Python
 // (_fold_to_intervals / _fold_to_blocks), with the same output. It takes
 // node-sized runs instead of single bases, so a run costs O(1) rather than one
-// step per base; runs that overlap in source fall back to the per-base walk.
+// step per base. Runs that overlap in source (two copies on one path) are first
+// split into colinear chains and each chain is folded on its own.
 
 #include <algorithm>
+#include <climits>
+#include <cstddef>
 #include <cstdint>
 #include <utility>
 #include <vector>
@@ -100,6 +103,38 @@ private:
     }
 };
 
+/// Chains searched for a run to join, most recently extended first.
+constexpr size_t CHAIN_SEARCH = 64;
+
+/// Split source-sorted runs into colinear chains: each run joins the nearest
+/// chain it continues (same direction, after it in source and in target), else
+/// starts a new one. Interleaved copies of a duplication become separate chains.
+inline std::vector<std::vector<Run>> chain(const std::vector<Run>& runs) {
+    std::vector<std::vector<Run>> chains;
+    std::vector<size_t> recent;                       // chain ids, least recent first
+    for (const Run& r : runs) {
+        size_t best = chains.size(), best_at = 0;
+        int64_t best_gap = INT64_MAX;
+        const size_t from = recent.size() > CHAIN_SEARCH ? recent.size() - CHAIN_SEARCH : 0;
+        for (size_t k = recent.size(); k-- > from;) {
+            const Run& last = chains[recent[k]].back();
+            const int64_t s_end = last.s0 + last.n, t_last = last.t0 + last.d * (last.n - 1);
+            const int64_t dt = (r.t0 - t_last) * r.d;
+            if (last.d != r.d || r.s0 < s_end || dt <= 0) continue;
+            const int64_t gap = (r.s0 - s_end) + dt;
+            if (gap < best_gap) { best_gap = gap; best = recent[k]; best_at = k; }
+        }
+        if (best == chains.size()) {
+            chains.push_back({r});
+        } else {
+            chains[best].push_back(r);
+            recent.erase(recent.begin() + static_cast<std::ptrdiff_t>(best_at));
+        }
+        recent.push_back(best);
+    }
+    return chains;
+}
+
 /// Fold one alignment's runs (one target path), in source order.
 inline std::vector<Piece> fold(std::vector<Run> runs, Kind kind) {
     std::vector<Piece> out;
@@ -110,20 +145,23 @@ inline std::vector<Piece> fold(std::vector<Run> runs, Kind kind) {
     for (size_t i = 1; i < runs.size() && !overlap; i++) {
         overlap = runs[i].s0 < runs[i - 1].s0 + runs[i - 1].n;
     }
-    Folder f(kind, out);
     if (!overlap) {
+        Folder f(kind, out);
         for (const Run& r : runs) f.add(r);
-    } else {
-        // Two copies on one path interleave in source order: walk every base,
-        // sorted by (source, target), exactly as the per-base fold did.
-        std::vector<std::pair<int64_t, int64_t>> pts;
-        for (const Run& r : runs) {
-            for (int64_t i = 0; i < r.n; i++) pts.emplace_back(r.s0 + i, r.t0 + r.d * i);
-        }
-        std::sort(pts.begin(), pts.end());
-        for (const auto& p : pts) f.add(p.first, p.second);
+        f.finish();
+        return out;
     }
-    f.finish();
+    // Folding interleaved copies together would alternate between them at
+    // every base, so fold each copy's chain separately.
+    for (const std::vector<Run>& c : chain(runs)) {
+        Folder f(kind, out);
+        for (const Run& r : c) f.add(r);
+        f.finish();
+    }
+    std::sort(out.begin(), out.end(), [](const Piece& a, const Piece& b) {
+        return a.source_start != b.source_start ? a.source_start < b.source_start
+                                                : a.target_start < b.target_start;
+    });
     return out;
 }
 

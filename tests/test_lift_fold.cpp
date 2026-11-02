@@ -1,5 +1,7 @@
 // Randomized check of liftfold::fold against a line-by-line port of the Python
-// folds it replaces (_fold_to_intervals / _fold_to_blocks).
+// folds it replaces (_fold_to_intervals / _fold_to_blocks). Inputs where runs
+// overlap in source are folded per chain instead, so those are checked for
+// coverage and piece count rather than equality.
 //   g++ -O2 -std=c++17 -I include tests/test_lift_fold.cpp -o /tmp/test_lift_fold
 #include "pangenome_index/lift_fold.hpp"
 
@@ -76,6 +78,52 @@ static bool same(const std::vector<Piece>& a, const std::vector<Piece>& b, bool 
     return true;
 }
 
+// Every point lies in some piece (on its diagonal, for blocks) and every piece
+// holds at least one point: the fold of overlapping runs loses and invents nothing.
+static bool covers(const std::vector<Piece>& out, const Pts& pts, bool blocks) {
+    std::vector<char> used(out.size(), 0);
+    for (const auto& [s, t] : pts) {
+        bool hit = false;
+        for (size_t k = 0; k < out.size(); k++) {
+            const Piece& p = out[k];
+            if (s < p.source_start || s >= p.source_end || t < p.target_start || t >= p.target_end) continue;
+            if (blocks) {
+                int64_t want = p.strand == '-' ? p.target_end - 1 - (s - p.source_start)
+                                               : p.target_start + (s - p.source_start);
+                if (t != want) continue;
+            }
+            hit = true; used[k] = 1;
+        }
+        if (!hit) return false;
+    }
+    return std::all_of(used.begin(), used.end(), [](char u) { return u; });
+}
+
+// k colinear copies whose nodes interleave in source fold to exactly k pieces.
+static size_t interleaved_failures(std::mt19937_64& rng) {
+    auto R = [&](int64_t lo, int64_t hi) { return std::uniform_int_distribution<int64_t>(lo, hi)(rng); };
+    size_t failures = 0;
+    for (int it = 0; it < 20000; it++) {
+        const int k = static_cast<int>(R(2, 6)), nodes = static_cast<int>(R(2, 200));
+        std::vector<Run> runs;
+        for (int c = 0; c < k; c++) {
+            int d = R(0, 1) ? 1 : -1;
+            int64_t s = 0, t = 100000 * (c + 1);
+            for (int i = 0; i < nodes; i++) {
+                int64_t n = R(1, 4);
+                runs.push_back({s, t, n, d});
+                s += n; t += d * n;
+            }
+        }
+        std::shuffle(runs.begin(), runs.end(), rng);
+        if (liftfold::fold(runs, Kind::INTERVALS).size() != static_cast<size_t>(k) ||
+            liftfold::fold(runs, Kind::BLOCKS).size() != static_cast<size_t>(k)) {
+            if (++failures <= 3) std::printf("FAIL interleaved case %d (k=%d)\n", it, k);
+        }
+    }
+    return failures;
+}
+
 int main() {
     std::mt19937_64 rng(1);
     auto R = [&](int64_t lo, int64_t hi) { return std::uniform_int_distribution<int64_t>(lo, hi)(rng); };
@@ -109,11 +157,14 @@ int main() {
 
         auto fi = liftfold::fold(runs, Kind::INTERVALS);
         auto fb = liftfold::fold(runs, Kind::BLOCKS);
-        bool ok = same(fi, py_intervals(pts), true) && same(fb, py_blocks(pts), true);
         cases++;
         std::vector<Run> sorted = runs;
         std::sort(sorted.begin(), sorted.end(), [](const Run& a, const Run& b) { return a.s0 < b.s0; });
-        for (size_t i = 1; i < sorted.size(); i++) if (sorted[i].s0 < sorted[i-1].s0 + sorted[i-1].n) { overlapping++; break; }
+        bool overlap = false;
+        for (size_t i = 1; i < sorted.size(); i++) if (sorted[i].s0 < sorted[i-1].s0 + sorted[i-1].n) { overlap = true; break; }
+        overlapping += overlap;
+        bool ok = overlap ? covers(fi, pts, false) && covers(fb, pts, true) && fi.size() <= runs.size()
+                          : same(fi, py_intervals(pts), true) && same(fb, py_blocks(pts), true);
         if (!ok && ++failures <= 5) {
             std::printf("FAIL case %d:", it);
             for (const Run& r : runs) std::printf(" (%ld,%ld,%ld,%d)", (long)r.s0, (long)r.t0, (long)r.n, r.d);
@@ -121,5 +172,8 @@ int main() {
         }
     }
     std::printf("%zu cases (%zu with overlapping runs), %zu failures\n", cases, overlapping, failures);
+    const size_t inter = interleaved_failures(rng);
+    std::printf("20000 interleaved-copy cases, %zu failures\n", inter);
+    failures += inter;
     return failures ? 1 : 0;
 }
