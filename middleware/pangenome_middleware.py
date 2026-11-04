@@ -14,12 +14,11 @@ It is kept at parity with the reference orchestration in
 pipeline (map -> build_surject_anchors -> surject_with_anchors), which surjects
 onto ANY haplotype at query time without pre-indexing it.
 
-Preset note: the long-read / BLAT mapping preset is applied inside the giraffe
-engine itself (apply_blat_preset in giraffe_engine.cpp); the middleware does not
-pass `--parameter-preset`. The only mapping knob exposed here is
-`max_multimaps` (0 = the engine's built-in BLAT default of 100; 1 = single best
-alignment per read, recommended for the one-line-per-read UI). Pass the
-LONG-READ minimizer + zipcodes to match the engine's preset.
+Preset note: giraffe-server picks its vg giraffe preset from
+$PANGENOME_GIRAFFE_PRESET (default hifi; "blat" reports up to 20 near-best
+copies with length-independent MAPQ). The only mapping knob exposed here is
+`max_multimaps` (0 = the preset's value; 1 = single best alignment per read).
+Pass the LONG-READ minimizer + zipcodes to match the long-read presets.
 """
 from __future__ import annotations
 
@@ -272,10 +271,9 @@ class PangenomeMiddleware:
     ) -> "PangenomeMiddleware":
         """Build both index configs from paths with correct defaults.
 
-        Pass the LONG-READ minimizer + zipcodes (they must match the engine's
-        long-read/BLAT preset). `max_multimaps=1` returns a single best
-        alignment per read (recommended for the UI); set 0 to fall back to the
-        engine's BLAT default of 100. No `--surject-target` is pre-indexed: the
+        Pass the LONG-READ minimizer + zipcodes (they must match the long-read
+        presets). `max_multimaps=1` returns a single best alignment per read;
+        0 uses the preset's value. No `--surject-target` is pre-indexed: the
         anchor pipeline surjects onto any haplotype at query time.
         """
         # Coerce None -> "": callers that build these from argparse pass None

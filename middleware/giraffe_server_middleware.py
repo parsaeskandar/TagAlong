@@ -54,8 +54,7 @@ class GiraffeServerConfig:
     distance_path: str
     zipcode_path: str
     threads: int = 8
-    # 0 means "use giraffe-server's built-in BLAT default (100)". Any value > 0
-    # is forwarded as `-M N` and overrides the BLAT default.
+    # 0 means "use the preset's value". Any value > 0 is forwarded as `-M N`.
     max_multimaps: int = 0
     batch_size: int = 256
     output_timeout_s: float = 60.0
