@@ -14,10 +14,11 @@ It is kept at parity with the reference orchestration in
 pipeline (map -> build_surject_anchors -> surject_with_anchors), which surjects
 onto ANY haplotype at query time without pre-indexing it.
 
-Preset note: giraffe-server picks its vg giraffe preset from
-$PANGENOME_GIRAFFE_PRESET (default hifi; "blat" reports up to 20 near-best
-copies with length-independent MAPQ). The only mapping knob exposed here is
-`max_multimaps` (0 = the preset's value; 1 = single best alignment per read).
+Preset note: giraffe-server takes its mapping parameters from its command
+line only. `preset` names the vg giraffe preset (default hifi; "blat" reports
+up to 20 near-best copies with length-independent MAPQ), `options` sets any
+vg giraffe option on top of it, and `max_multimaps` caps the alignments per
+read (0 = the preset's value; 1 = single best alignment per read).
 Pass the LONG-READ minimizer + zipcodes to match the long-read presets.
 """
 from __future__ import annotations
@@ -265,6 +266,8 @@ class PangenomeMiddleware:
         t2: str = "",
         sri: str = "",
         threads: int = 8,
+        preset: str = "",
+        options: Sequence[Tuple[str, str]] = (),
         max_multimaps: int = 1,
         batch_size: int = 256,
         output_timeout_s: float = 120.0,
@@ -273,8 +276,10 @@ class PangenomeMiddleware:
 
         Pass the LONG-READ minimizer + zipcodes (they must match the long-read
         presets). `max_multimaps=1` returns a single best alignment per read;
-        0 uses the preset's value. No `--surject-target` is pre-indexed: the
-        anchor pipeline surjects onto any haplotype at query time.
+        0 uses the preset's value. `preset` is the vg giraffe preset (empty =
+        the server's default, hifi) and `options` are (name, value) pairs set
+        on top of it. No `--surject-target` is pre-indexed: the anchor pipeline
+        surjects onto any haplotype at query time.
         """
         # Coerce None -> "": callers that build these from argparse pass None
         # for an omitted path, and the extension's load() takes str.
@@ -294,6 +299,8 @@ class PangenomeMiddleware:
             distance_path=distance,
             zipcode_path=zipcodes,
             threads=threads,
+            preset=preset,
+            options=tuple(options),
             max_multimaps=max_multimaps,
             batch_size=batch_size,
             output_timeout_s=output_timeout_s,

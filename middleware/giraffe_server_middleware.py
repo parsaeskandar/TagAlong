@@ -54,6 +54,13 @@ class GiraffeServerConfig:
     distance_path: str
     zipcode_path: str
     threads: int = 8
+    # vg giraffe parameter preset, forwarded as `--parameter-preset`. Empty
+    # means the server's default (hifi).
+    preset: str = ""
+    # vg giraffe options set on top of the preset, as (long name, value) pairs,
+    # e.g. ("mapq-score-window", "150"). Each is forwarded as `--set NAME=VALUE`.
+    # A flag has an empty value and is forwarded as `--set NAME`.
+    options: Sequence[Tuple[str, str]] = ()
     # 0 means "use the preset's value". Any value > 0 is forwarded as `-M N`.
     max_multimaps: int = 0
     batch_size: int = 256
@@ -131,6 +138,10 @@ class GiraffeServerMiddleware:
                 "-b", str(self.cfg.batch_size),
                 "--framed-output",
             ]
+            if self.cfg.preset:
+                cmd.extend(["--parameter-preset", self.cfg.preset])
+            for name, value in self.cfg.options:
+                cmd.extend(["--set", f"{name}={value}" if value != "" else name])
             if self.cfg.max_multimaps > 0:
                 cmd.extend(["-M", str(self.cfg.max_multimaps)])
             for target in self.cfg.surject_target_paths:

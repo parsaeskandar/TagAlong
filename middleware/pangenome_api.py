@@ -1264,6 +1264,14 @@ def _parse_args() -> argparse.Namespace:
                    help="Translation Table 2 (OPTIONAL). Omit to run table-free: "
                         "translation then uses only Table 1 + the GBWT/tag array.")
     p.add_argument("--threads", type=int, default=8)
+    p.add_argument("--preset", default="",
+                   help="vg giraffe parameter preset for the engine "
+                        "(default: the server's default, hifi).")
+    p.add_argument("--set", dest="giraffe_options", action="append", default=[],
+                   metavar="NAME[=VALUE]",
+                   help="Set a vg giraffe option on top of the preset, by its "
+                        "long name, e.g. --set mapq-score-window=150. A flag "
+                        "takes no value. May repeat.")
     p.add_argument("--max-multimaps", type=int, default=1,
                    help="ENGINE ceiling (-M): the most alignments giraffe will "
                         "report per read. Fixed at startup; raising it lets "
@@ -1327,7 +1335,10 @@ def main() -> int:
                 vg_binary=args.vg, gbz=args.gbz, minimizer=args.minimizer,
                 distance=args.dist, zipcodes=args.zipcodes, ri=args.ri, tags=args.tags,
                 gbwt_ri=args.gbwt_ri, t1=args.t1, t2=args.t2, sri=args.sri,
-                threads=args.threads, max_multimaps=args.max_multimaps,
+                threads=args.threads, preset=args.preset,
+                options=[tuple(o.split("=", 1)) if "=" in o else (o, "")
+                         for o in args.giraffe_options],
+                max_multimaps=args.max_multimaps,
                 output_timeout_s=args.job_timeout,
             )
             mw.wait_until_ready()
