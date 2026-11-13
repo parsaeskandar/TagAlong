@@ -34,6 +34,7 @@ from .giraffe_server_middleware import (
     FastqRead,
     GiraffeServerConfig,
     GiraffeServerMiddleware,
+    request_error,
 )
 
 # `liftover_ext` is the native pybind11 extension. It is imported lazily inside
@@ -598,7 +599,8 @@ class PangenomeMiddleware:
         One anchor pass serves all targets, and every surjection goes to
         giraffe-server in a single batch that it runs on its worker pool.
         Returns (target, status, gaf_lines) per target, in order; status is
-        "ok" or the reason no surjection was attempted ("no_anchors (...)")."""
+        "ok", the reason no surjection was attempted ("no_anchors (...)"), or
+        giraffe-server's message for a request it failed ("error (...)")."""
         built = self.build_surject_anchors_multi(graph_alignment_gaf, targets)
         requests, slots = [], []
         out: List[Tuple[str, str, List[str]]] = []
@@ -611,6 +613,9 @@ class PangenomeMiddleware:
             requests.append((graph_alignment_gaf, anchors, t, path_len))
         for slot, lines in zip(slots, self._giraffe.surject_with_anchors_batch(requests)):
             t, status, _ = out[slot]
+            error = request_error(lines)
+            if error is not None:
+                status = f"error ({error})"
             out[slot] = (t, status, lines)
         return out
 

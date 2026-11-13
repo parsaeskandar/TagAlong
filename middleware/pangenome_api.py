@@ -87,6 +87,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Deque, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, parse_qs
 
+from .giraffe_server_middleware import request_error
 from .pangenome_middleware import PangenomeMiddleware
 
 _GAF_TAG_START = 12
@@ -320,6 +321,9 @@ def _alignment_record(t: str, status: str, sj: Optional[Dict[str, Any]],
         if status.startswith("no_anchors"):
             return {"haplotype": t, "status": "no_anchors",
                     "detail": status[len("no_anchors"):].strip(" ()")}
+        if status.startswith("error"):
+            return {"haplotype": t, "status": "error",
+                    "detail": status[len("error"):].strip(" ()")}
         return {"haplotype": t, "status": status}
     if not sj:
         return {"haplotype": t, "status": "surjection_failed"}
@@ -663,7 +667,12 @@ class Service:
             qlen = len(seq["sequence"])
             job.gafs[seq["name"]] = list(alignments)
             job.gaf_bytes += sum(len(a) for a in alignments)
-            if not alignments:
+            error = request_error(alignments)
+            if error is not None:
+                # giraffe-server answered this read with an ERROR frame.
+                results.append({"name": seq["name"], "status": "error",
+                                "error": error, "query_length": qlen, "alignments": []})
+            elif not alignments:
                 results.append({"name": seq["name"], "status": "unmapped",
                                 "error": None, "query_length": qlen, "alignments": []})
             else:

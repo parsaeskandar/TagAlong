@@ -21,8 +21,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from middleware.giraffe_server_middleware import (  # noqa: E402
+    FailedRequest,
     GiraffeServerConfig,
     GiraffeServerMiddleware,
+    request_error,
 )
 
 MOCK = REPO_ROOT / "tests" / "fixtures" / "mock_giraffe_server.py"
@@ -170,3 +172,36 @@ def test_mixed_map_and_surject_concurrently(mw):
             assert f"gaf:MAP{t}_{i}" in m[i][0]
         s = results[("surj", t)]
         assert any(f"surj:sread{t}" in line for line in s)
+
+
+def test_failed_read_fails_only_itself(mw):
+    """An ERROR frame answers one read. The rest of the batch still comes back."""
+    out = mw.map_reads([("a", "AAAA", "IIII"), ("b", "FAIL", "IIII"), ("c", "CCCC", "IIII")])
+    assert len(out) == 3
+    assert "gaf:AAAA" in out[0][0] and request_error(out[0]) is None
+    assert isinstance(out[1], FailedRequest) and out[1] == []
+    assert request_error(out[1]) == "mock mapping failure"
+    assert "gaf:CCCC" in out[2][0] and request_error(out[2]) is None
+
+
+def test_failed_surjection_carries_the_message(mw):
+    gaf = "sread\t50\t0\t50\t+\tp\t100\t0\t50\t50\t50\t60"
+    out = mw.surject_with_anchors(gaf, [FakeAnchor()], "FAIL")
+    assert out == [] and request_error(out) == "mock surjection failure"
+
+    batch = mw.surject_with_anchors_batch([
+        (gaf, [FakeAnchor()], "TGT", 100),
+        (gaf, [FakeAnchor()], "FAIL", 100),
+        (gaf, [FakeAnchor()], "TGT2", 100),
+    ])
+    assert [request_error(lines) for lines in batch] == [None, "mock surjection failure", None]
+    assert any("surj:sread" in line for line in batch[0])
+    assert any("surj:sread" in line for line in batch[2])
+
+
+def test_server_keeps_working_after_errors(mw):
+    """Errors do not end the server or leave a caller waiting."""
+    for _ in range(3):
+        assert request_error(mw.map_reads([("x", "FAIL", "IIII")])[0]) is not None
+    out = mw.map_reads([("y", "GGGG", "IIII")])
+    assert "gaf:GGGG" in out[0][0]
