@@ -5,7 +5,7 @@ Speaks just enough of the frame protocol to exercise the dispatcher +
 demuxer without needing a real vg or any indexes:
 
   * a read line ``name<TAB>seq[<TAB>qual[<TAB>target]]`` is buffered;
-  * ``PROCESS_BATCH`` / ``FLUSH_NOW`` emits, for each buffered read, a frame
+  * ``PROCESS_BATCH`` emits, for each buffered read, a frame
     ``READ<TAB>name<TAB>1`` followed by ``name<TAB>gaf:<seq>`` — echoing the
     sequence so a test can verify each frame reached the right caller;
   * ``SURJECT_WITH_ANCHORS<TAB>name<TAB>target<TAB>path_len<TAB>n`` flushes any
@@ -45,7 +45,7 @@ def main() -> None:
             break
         line = line.rstrip("\n")
 
-        if line in ("PROCESS_BATCH", "FLUSH_NOW"):
+        if line == "PROCESS_BATCH":
             flush_batch()
             continue
 

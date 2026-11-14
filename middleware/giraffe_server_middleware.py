@@ -314,9 +314,7 @@ class GiraffeServerMiddleware:
             parts.append(
                 f"{a.gbwt_edge_begin_node}\t{a.gbwt_edge_begin_offset}\t"
                 f"{a.gbwt_edge_end_node}\t{a.gbwt_edge_end_offset}\t"
-                f"{a.path_offset_step_begin}\t{a.path_offset_step_end}\t"
-                f"{a.read_begin_offset}\t{a.read_end_offset}\t"
-                f"{a.source_mapping_begin}\t{a.source_mapping_end}\n"
+                f"{a.path_offset_step_begin}\t{a.path_offset_step_end}\n"
             )
         parts.append(gaf if gaf.endswith("\n") else gaf + "\n")
         return "".join(parts)
