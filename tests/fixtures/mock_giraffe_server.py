@@ -1,29 +1,39 @@
 #!/usr/bin/env python3
 """A mock `vg giraffe-server` for testing the middleware multiplexer.
 
-Speaks just enough of the framed-output protocol to exercise the dispatcher +
+Speaks just enough of the frame protocol to exercise the dispatcher +
 demuxer without needing a real vg or any indexes:
 
   * a read line ``name<TAB>seq[<TAB>qual[<TAB>target]]`` is buffered;
-  * ``PROCESS_BATCH`` / ``FLUSH_NOW`` emits, for each buffered read, a frame
+  * ``PROCESS_BATCH`` emits, for each buffered read, a frame
     ``READ<TAB>name<TAB>1`` followed by ``name<TAB>gaf:<seq>`` — echoing the
     sequence so a test can verify each frame reached the right caller;
   * ``SURJECT_WITH_ANCHORS<TAB>name<TAB>target<TAB>path_len<TAB>n`` flushes any
     pending reads (like the real server), consumes ``n`` anchor lines + one GAF
-    line, and emits ``READ<TAB>name<TAB>1`` + ``name<TAB>surj:<gaf>``.
+    line, and emits ``READ<TAB>name<TAB>1`` + ``name<TAB>surj:<gaf>``;
+  * a read whose sequence is ``FAIL``, or a surjection whose target is
+    ``FAIL``, gets ``ERROR<TAB>name<TAB>message`` instead, and a line that is
+    not a request gets ``ERROR<TAB>*<TAB>message``.
 
-All command-line arguments are ignored. Reads stdin until EOF.
+Like the real server, it exits at once if given ``--framed-output``, which no
+longer exists. Other command-line arguments are ignored. Reads stdin until EOF.
 """
 import sys
 
 
 def main() -> None:
+    if "--framed-output" in sys.argv:
+        sys.stderr.write("unrecognized option '--framed-output'\n")
+        sys.exit(1)
     out = sys.stdout
     stdin = sys.stdin
     buffered = []  # list of (name, seq)
 
     def flush_batch() -> None:
         for name, seq in buffered:
+            if seq == "FAIL":
+                out.write(f"ERROR\t{name}\tmock mapping failure\n")
+                continue
             out.write(f"READ\t{name}\t1\n")
             out.write(f"{name}\tgaf:{seq}\n")
         buffered.clear()
@@ -35,7 +45,7 @@ def main() -> None:
             break
         line = line.rstrip("\n")
 
-        if line in ("PROCESS_BATCH", "FLUSH_NOW"):
+        if line == "PROCESS_BATCH":
             flush_batch()
             continue
 
@@ -47,8 +57,11 @@ def main() -> None:
             for _ in range(n_anchors):
                 stdin.readline()          # discard anchor lines
             gaf = stdin.readline().rstrip("\n")
-            out.write(f"READ\t{name}\t1\n")
-            out.write(f"{name}\tsurj:{gaf}\n")
+            if len(fields) > 2 and fields[2] == "FAIL":
+                out.write(f"ERROR\t{name}\tmock surjection failure\n")
+            else:
+                out.write(f"READ\t{name}\t1\n")
+                out.write(f"{name}\tsurj:{gaf}\n")
             out.flush()
             continue
 
@@ -56,6 +69,9 @@ def main() -> None:
         parts = line.split("\t")
         if len(parts) >= 2:
             buffered.append((parts[0], parts[1]))
+        elif line:
+            out.write("ERROR\t*\tnot a request\n")
+            out.flush()
 
 
 if __name__ == "__main__":

@@ -87,6 +87,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Deque, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, parse_qs
 
+from .giraffe_server_middleware import request_error
 from .pangenome_middleware import PangenomeMiddleware
 
 _GAF_TAG_START = 12
@@ -320,6 +321,9 @@ def _alignment_record(t: str, status: str, sj: Optional[Dict[str, Any]],
         if status.startswith("no_anchors"):
             return {"haplotype": t, "status": "no_anchors",
                     "detail": status[len("no_anchors"):].strip(" ()")}
+        if status.startswith("error"):
+            return {"haplotype": t, "status": "error",
+                    "detail": status[len("error"):].strip(" ()")}
         return {"haplotype": t, "status": status}
     if not sj:
         return {"haplotype": t, "status": "surjection_failed"}
@@ -663,7 +667,12 @@ class Service:
             qlen = len(seq["sequence"])
             job.gafs[seq["name"]] = list(alignments)
             job.gaf_bytes += sum(len(a) for a in alignments)
-            if not alignments:
+            error = request_error(alignments)
+            if error is not None:
+                # giraffe-server answered this read with an ERROR frame.
+                results.append({"name": seq["name"], "status": "error",
+                                "error": error, "query_length": qlen, "alignments": []})
+            elif not alignments:
                 results.append({"name": seq["name"], "status": "unmapped",
                                 "error": None, "query_length": qlen, "alignments": []})
             else:
@@ -1264,6 +1273,14 @@ def _parse_args() -> argparse.Namespace:
                    help="Translation Table 2 (OPTIONAL). Omit to run table-free: "
                         "translation then uses only Table 1 + the GBWT/tag array.")
     p.add_argument("--threads", type=int, default=8)
+    p.add_argument("--preset", default="",
+                   help="vg giraffe parameter preset for the engine "
+                        "(default: the server's default, hifi).")
+    p.add_argument("--set", dest="giraffe_options", action="append", default=[],
+                   metavar="NAME[=VALUE]",
+                   help="Set a vg giraffe option on top of the preset, by its "
+                        "long name, e.g. --set mapq-score-window=150. A flag "
+                        "takes no value. May repeat.")
     p.add_argument("--max-multimaps", type=int, default=1,
                    help="ENGINE ceiling (-M): the most alignments giraffe will "
                         "report per read. Fixed at startup; raising it lets "
@@ -1327,7 +1344,10 @@ def main() -> int:
                 vg_binary=args.vg, gbz=args.gbz, minimizer=args.minimizer,
                 distance=args.dist, zipcodes=args.zipcodes, ri=args.ri, tags=args.tags,
                 gbwt_ri=args.gbwt_ri, t1=args.t1, t2=args.t2, sri=args.sri,
-                threads=args.threads, max_multimaps=args.max_multimaps,
+                threads=args.threads, preset=args.preset,
+                options=[tuple(o.split("=", 1)) if "=" in o else (o, "")
+                         for o in args.giraffe_options],
+                max_multimaps=args.max_multimaps,
                 output_timeout_s=args.job_timeout,
             )
             mw.wait_until_ready()

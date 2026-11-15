@@ -14,12 +14,12 @@ It is kept at parity with the reference orchestration in
 pipeline (map -> build_surject_anchors -> surject_with_anchors), which surjects
 onto ANY haplotype at query time without pre-indexing it.
 
-Preset note: the long-read / BLAT mapping preset is applied inside the giraffe
-engine itself (apply_blat_preset in giraffe_engine.cpp); the middleware does not
-pass `--parameter-preset`. The only mapping knob exposed here is
-`max_multimaps` (0 = the engine's built-in BLAT default of 100; 1 = single best
-alignment per read, recommended for the one-line-per-read UI). Pass the
-LONG-READ minimizer + zipcodes to match the engine's preset.
+Preset note: giraffe-server takes its mapping parameters from its command
+line only. `preset` names the vg giraffe preset (default hifi; "blat" reports
+up to 20 near-best copies with length-independent MAPQ), `options` sets any
+vg giraffe option on top of it, and `max_multimaps` caps the alignments per
+read (0 = the preset's value; 1 = single best alignment per read).
+Pass the LONG-READ minimizer + zipcodes to match the long-read presets.
 """
 from __future__ import annotations
 
@@ -34,6 +34,7 @@ from .giraffe_server_middleware import (
     FastqRead,
     GiraffeServerConfig,
     GiraffeServerMiddleware,
+    request_error,
 )
 
 # `liftover_ext` is the native pybind11 extension. It is imported lazily inside
@@ -266,17 +267,20 @@ class PangenomeMiddleware:
         t2: str = "",
         sri: str = "",
         threads: int = 8,
+        preset: str = "",
+        options: Sequence[Tuple[str, str]] = (),
         max_multimaps: int = 1,
         batch_size: int = 256,
         output_timeout_s: float = 120.0,
     ) -> "PangenomeMiddleware":
         """Build both index configs from paths with correct defaults.
 
-        Pass the LONG-READ minimizer + zipcodes (they must match the engine's
-        long-read/BLAT preset). `max_multimaps=1` returns a single best
-        alignment per read (recommended for the UI); set 0 to fall back to the
-        engine's BLAT default of 100. No `--surject-target` is pre-indexed: the
-        anchor pipeline surjects onto any haplotype at query time.
+        Pass the LONG-READ minimizer + zipcodes (they must match the long-read
+        presets). `max_multimaps=1` returns a single best alignment per read;
+        0 uses the preset's value. `preset` is the vg giraffe preset (empty =
+        the server's default, hifi) and `options` are (name, value) pairs set
+        on top of it. No `--surject-target` is pre-indexed: the anchor pipeline
+        surjects onto any haplotype at query time.
         """
         # Coerce None -> "": callers that build these from argparse pass None
         # for an omitted path, and the extension's load() takes str.
@@ -296,6 +300,8 @@ class PangenomeMiddleware:
             distance_path=distance,
             zipcode_path=zipcodes,
             threads=threads,
+            preset=preset,
+            options=tuple(options),
             max_multimaps=max_multimaps,
             batch_size=batch_size,
             output_timeout_s=output_timeout_s,
@@ -593,7 +599,8 @@ class PangenomeMiddleware:
         One anchor pass serves all targets, and every surjection goes to
         giraffe-server in a single batch that it runs on its worker pool.
         Returns (target, status, gaf_lines) per target, in order; status is
-        "ok" or the reason no surjection was attempted ("no_anchors (...)")."""
+        "ok", the reason no surjection was attempted ("no_anchors (...)"), or
+        giraffe-server's message for a request it failed ("error (...)")."""
         built = self.build_surject_anchors_multi(graph_alignment_gaf, targets)
         requests, slots = [], []
         out: List[Tuple[str, str, List[str]]] = []
@@ -606,6 +613,9 @@ class PangenomeMiddleware:
             requests.append((graph_alignment_gaf, anchors, t, path_len))
         for slot, lines in zip(slots, self._giraffe.surject_with_anchors_batch(requests)):
             t, status, _ = out[slot]
+            error = request_error(lines)
+            if error is not None:
+                status = f"error ({error})"
             out[slot] = (t, status, lines)
         return out
 

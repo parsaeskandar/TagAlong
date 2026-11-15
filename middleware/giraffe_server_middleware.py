@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Long-lived middleware around `vg giraffe-server` framed-output mode.
+"""Long-lived middleware around `vg giraffe-server`.
 
 Concurrency model (single loaded index copy, many concurrent callers):
 
   * `vg giraffe-server` already maps a batch across its `-t N` worker threads
-    from ONE loaded set of indexes, and its framed output is keyed by read
-    name (`READ<TAB>name<TAB>count`). So we do NOT need multiple engine copies
+    from ONE loaded set of indexes, and every frame it writes is keyed by read
+    name (`READ<TAB>name<TAB>count`, or `ERROR<TAB>name<TAB>message` for a
+    request that failed). So we do NOT need multiple engine copies
     to serve concurrent users — we need to keep the single subprocess busy and
     route its output back to the right caller.
 
@@ -16,7 +17,7 @@ Concurrency model (single loaded index copy, many concurrent callers):
     atomically.
 
   * A single **demuxer** thread reads the subprocess stdout, parses each
-    `READ` frame, and hands it to the request that owns that name.
+    `READ` or `ERROR` frame, and hands it to the request that owns that name.
 
   * Callers (`map_reads`, `surject_with_anchors`) assign globally-unique
     internal names, enqueue their work, and block only on *their own* frames
@@ -46,6 +47,20 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 FastqRead = Tuple[str, ...]
 
 
+class FailedRequest(list):
+    """The result of a request that giraffe-server answered with an ERROR
+    frame: an empty list of GAF lines that carries the server's message."""
+
+    def __init__(self, error: str) -> None:
+        super().__init__()
+        self.error = error
+
+
+def request_error(lines: List[str]) -> Optional[str]:
+    """The server's message if this result is a failed request, else None."""
+    return lines.error if isinstance(lines, FailedRequest) else None
+
+
 @dataclass
 class GiraffeServerConfig:
     vg_binary: str
@@ -54,8 +69,14 @@ class GiraffeServerConfig:
     distance_path: str
     zipcode_path: str
     threads: int = 8
-    # 0 means "use giraffe-server's built-in BLAT default (100)". Any value > 0
-    # is forwarded as `-M N` and overrides the BLAT default.
+    # vg giraffe parameter preset, forwarded as `--parameter-preset`. Empty
+    # means the server's default (hifi).
+    preset: str = ""
+    # vg giraffe options set on top of the preset, as (long name, value) pairs,
+    # e.g. ("mapq-score-window", "150"). Each is forwarded as `--set NAME=VALUE`.
+    # A flag has an empty value and is forwarded as `--set NAME`.
+    options: Sequence[Tuple[str, str]] = ()
+    # 0 means "use the preset's value". Any value > 0 is forwarded as `-M N`.
     max_multimaps: int = 0
     batch_size: int = 256
     output_timeout_s: float = 60.0
@@ -130,8 +151,11 @@ class GiraffeServerMiddleware:
                 "-z", self.cfg.zipcode_path,
                 "-t", str(self.cfg.threads),
                 "-b", str(self.cfg.batch_size),
-                "--framed-output",
             ]
+            if self.cfg.preset:
+                cmd.extend(["--parameter-preset", self.cfg.preset])
+            for name, value in self.cfg.options:
+                cmd.extend(["--set", f"{name}={value}" if value != "" else name])
             if self.cfg.max_multimaps > 0:
                 cmd.extend(["-M", str(self.cfg.max_multimaps)])
             for target in self.cfg.surject_target_paths:
@@ -201,8 +225,9 @@ class GiraffeServerMiddleware:
         """Map a batch of reads; return one list of GAF lines per input read,
         in input order. Each read is (name, seq, qual) or (name, seq, qual,
         target); `surject_target` supplies a default target for reads without
-        one. Thread-safe: concurrent calls are coalesced onto the one
-        subprocess and demultiplexed back by name."""
+        one. A read the server could not map has a FailedRequest as its list
+        (see request_error). Thread-safe: concurrent calls are coalesced onto
+        the one subprocess and demultiplexed back by name."""
         if self._proc is None:
             self.start()
 
@@ -264,7 +289,8 @@ class GiraffeServerMiddleware:
         read_name: Optional[str] = None,
     ) -> List[str]:
         """Surject a graph alignment onto `target_haplotype` using pre-computed
-        anchors (SURJECT_WITH_ANCHORS). Returns the surjected GAF line(s).
+        anchors (SURJECT_WITH_ANCHORS). Returns the surjected GAF line(s), or
+        a FailedRequest if the server answered with an error.
         Thread-safe. The frame is keyed by a unique internal name, so the GAF
         content keeps its own read name; `read_name` is accepted for API
         compatibility but the wire framing uses a unique id."""
@@ -288,9 +314,7 @@ class GiraffeServerMiddleware:
             parts.append(
                 f"{a.gbwt_edge_begin_node}\t{a.gbwt_edge_begin_offset}\t"
                 f"{a.gbwt_edge_end_node}\t{a.gbwt_edge_end_offset}\t"
-                f"{a.path_offset_step_begin}\t{a.path_offset_step_end}\t"
-                f"{a.read_begin_offset}\t{a.read_end_offset}\t"
-                f"{a.source_mapping_begin}\t{a.source_mapping_end}\n"
+                f"{a.path_offset_step_begin}\t{a.path_offset_step_end}\n"
             )
         parts.append(gaf if gaf.endswith("\n") else gaf + "\n")
         return "".join(parts)
@@ -298,8 +322,9 @@ class GiraffeServerMiddleware:
     def surject_with_anchors_batch(self, requests) -> List[List[str]]:
         """Surject many (gaf, anchors, target, path_len) requests in ONE submit.
 
-        Returns the surjected GAF lines per request, in input order. vg runs
-        the blocks on its --surject-threads pool, so N targets cost about one
+        Returns the surjected GAF lines per request, in input order, with a
+        FailedRequest for a request the server answered with an error. vg runs
+        the blocks as tasks on its `-t` threads, so N targets cost about one
         round trip instead of N sequential ones."""
         if self._proc is None:
             self.start()
@@ -424,8 +449,14 @@ class GiraffeServerMiddleware:
                         if broken:
                             break
                         self._deliver(name, mapped)
-                    # malformed header: ignore and resync on the next READ line
-                # non-READ stray line: ignore
+                    # malformed header: ignore and resync on the next frame
+                elif header.startswith("ERROR\t"):
+                    # ERROR<TAB>name<TAB>message. The name is * for a line the
+                    # server could not read as a request; nobody owns that.
+                    parts = header.split("\t", 2)
+                    if len(parts) == 3:
+                        self._deliver(parts[1], FailedRequest(parts[2]))
+                # any other stray line: ignore
                 line = stream.readline()
         except Exception:
             pass
