@@ -103,6 +103,9 @@ struct SourceMapping {
     /// offsets above are estimated proportionally and match counts are unknown;
     /// callers must not read a zero here as "nothing matched".
     size_t matched_bases = 0;
+    /// Read bases in this mapping that are aligned to the node, as a match or
+    /// a mismatch. Inserted and soft-clipped bases are not counted.
+    size_t aligned_bases = 0;
     /// Number of bases the mapping consumes on the graph side (= path_from_length
     /// of the mapping's edits combined).
     size_t mapping_from_length = 0;

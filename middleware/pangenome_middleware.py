@@ -479,10 +479,12 @@ class PangenomeMiddleware:
         Returns [{haplotype, coverage, covered_bp, identity, matched_bp}, ...]
         ranked best-first:
 
-          coverage  0-100, aligned read bases on nodes this haplotype visits.
+          coverage  0-100, the share of the read that is aligned to nodes
+                    this haplotype visits. Inserted and soft-clipped bases
+                    are not aligned to any node, so they lower it.
                     "How much of the sequence is present here at all."
-          identity  0-100, of those bases, the ones that also MATCHED, taken
-                    from the GAF cs:Z: string. "How much actually agrees."
+          identity  0-100, the share of the read that also MATCHED there,
+                    taken from the GAF cs:Z: string. "How much actually agrees."
                     Always <= coverage. The key is ABSENT when the GAF had no
                     cs string, meaning unmeasured rather than zero.
 
