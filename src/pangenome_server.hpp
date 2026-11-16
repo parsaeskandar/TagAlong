@@ -25,12 +25,14 @@ namespace seqtrans { struct PathCatalog; }
 /// omitted.
 struct HaplotypeCoverage {
     std::string haplotype;    ///< two-field haplotype name, e.g. "HG00097#1"
-    uint64_t covered_bp = 0;  ///< aligned read bases on nodes this haplotype visits
-    double coverage = 0.0;    ///< covered_bp as a percentage of aligned bases, 0..100
+    /// Read bases aligned to nodes this haplotype visits. Inserted and
+    /// soft-clipped bases are not counted.
+    uint64_t covered_bp = 0;
+    double coverage = 0.0;    ///< covered_bp as a percentage of the read length, 0..100
     /// Aligned read bases that BOTH lie on a node this haplotype visits AND
     /// matched there, per the GAF cs:Z: string.
     uint64_t matched_bp = 0;
-    /// matched_bp as a percentage of aligned bases, 0..100. Always <= coverage,
+    /// matched_bp as a percentage of the read length, 0..100. Always <= coverage,
     /// since it counts a subset of the same bases; the difference is the read's
     /// mismatch burden on this haplotype's nodes.
     ///

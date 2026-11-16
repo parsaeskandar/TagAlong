@@ -1929,6 +1929,7 @@ gaf_to_source_mappings(const std::string& gaf_str,
             size_t read_begin = query_pos;
             size_t path_at_node_start = path_pos;
             size_t node_matched = 0;
+            size_t node_aligned = 0;
 
             // Walk CIGAR until we exhaust this node or run out of ops.
             while (path_pos < path_node_end && cigar_i < cigar_ops.size()) {
@@ -1949,6 +1950,7 @@ gaf_to_source_mappings(const std::string& gaf_str,
                 }
 
                 if (op == '=') node_matched += steps;
+                if (consumes_path && consumes_query) node_aligned += steps;
                 if (consumes_path)  path_pos  += steps;
                 if (consumes_query) query_pos += steps;
 
@@ -1969,6 +1971,7 @@ gaf_to_source_mappings(const std::string& gaf_str,
             sm.node_offset_in_node = node_offset;
             sm.mapping_from_length = path_pos - path_at_node_start;
             sm.matched_bases = have_matches ? node_matched : 0;
+            sm.aligned_bases = node_aligned;
             result.push_back(sm);
 
             path_node_start = path_node_end;
@@ -2013,6 +2016,7 @@ gaf_to_source_mappings(const std::string& gaf_str,
             sm.read_end_offset = read_e;
             sm.node_offset_in_node = cov_start - path_node_start;
             sm.mapping_from_length = cov_len;
+            sm.aligned_bases = read_e - read_b;
             result.push_back(sm);
 
             path_node_start = node_end;
@@ -2063,6 +2067,16 @@ Index::haplotype_coverage(const std::string& gaf_str, double min_coverage,
     auto mappings = gaf_to_source_mappings(gaf_str, gbz_->graph);
     if (mappings.empty()) return out;
 
+    // The scores are shares of the whole read. Its length is the second GAF
+    // column.
+    uint64_t read_length = 0;
+    try {
+        read_length = std::stoull(split_tabs_strict(gaf_str)[1]);
+    } catch (const std::exception&) {
+        return out;
+    }
+    if (read_length == 0) return out;
+
     const gbwt::GBWT& gbwt_index = gbz_->index;
     const bool have_names = gbwt_index.hasMetadata() &&
                             gbwt_index.metadata.hasPathNames() &&
@@ -2078,7 +2092,7 @@ Index::haplotype_coverage(const std::string& gaf_str, double min_coverage,
     // unknown rather than zero.
     bool any_matches = false;
     std::unordered_set<std::string> here;
-    uint64_t total_bp = 0;
+    uint64_t aligned_bp = 0;
 
     // Who visits a node: the .sri when loaded, else the GBWT FastLocate. Only
     // the sequence id is read, which both pack identically; the offsets differ
@@ -2101,10 +2115,11 @@ Index::haplotype_coverage(const std::string& gaf_str, double min_coverage,
     };
 
     for (const panindexer::SourceMapping& m : mappings) {
-        const uint64_t bp = (m.read_end_offset > m.read_begin_offset)
-                            ? (m.read_end_offset - m.read_begin_offset) : 0;
-        if (bp == 0) continue;   // pure insertion: no graph node to credit
-        total_bp += bp;
+        // Only bases aligned to the node count. Inserted and soft-clipped
+        // bases are on no haplotype.
+        const uint64_t bp = m.aligned_bases;
+        if (bp == 0) continue;
+        aligned_bp += bp;
         if (m.matched_bases > 0) any_matches = true;
 
         // Which haplotypes visit this node? Count a haplotype once per node even
@@ -2139,7 +2154,7 @@ Index::haplotype_coverage(const std::string& gaf_str, double min_coverage,
         }
     }
 
-    if (total_bp == 0) return out;
+    if (aligned_bp == 0) return out;
 
     // Optionally round the list out to every haplotype in the graph, so callers
     // that want a complete ranked table see non-overlapping ones as an explicit
@@ -2153,7 +2168,7 @@ Index::haplotype_coverage(const std::string& gaf_str, double min_coverage,
     out.reserve(covered.size());
     for (const auto& kv : covered) {
         const double pct = 100.0 * static_cast<double>(kv.second) /
-                                   static_cast<double>(total_bp);
+                                   static_cast<double>(read_length);
         if (pct < min_coverage) continue;
         HaplotypeCoverage hc;
         hc.haplotype = kv.first;
@@ -2163,7 +2178,7 @@ Index::haplotype_coverage(const std::string& gaf_str, double min_coverage,
             auto mit = matched.find(kv.first);
             hc.matched_bp = (mit == matched.end()) ? 0 : mit->second;
             hc.identity = 100.0 * static_cast<double>(hc.matched_bp) /
-                                  static_cast<double>(total_bp);
+                                  static_cast<double>(read_length);
             hc.has_identity = true;
         }
         out.push_back(std::move(hc));
